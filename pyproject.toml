@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentoquant"
+version = "0.1.0"
+description = "AgentoQuant: an agentic hourly crypto trading system (Kraken spot, paper-first, human veto via Telegram)."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11,<3.12"
+authors = [{ name = "Shahrad" }]
+keywords = ["trading", "crypto", "kraken", "agents", "freqtrade"]
+
+# Pinned dependency table from tasks/schema_scaffold_addendum.md section 2.
+# Pins are ranges on purpose: `uv.lock` freezes the exact resolved versions and is
+# committed, so every later task installs from the lockfile, not from these ranges.
+dependencies = [
+    "freqtrade>=2026.5,<2027",
+    "ccxt>=4.4,<5",
+    "duckdb>=1.4.3,<1.5",
+    "pyarrow>=17,<18",
+    "lightgbm>=4.6,<5",
+    "scikit-learn>=1.5,<2",
+    "statsforecast>=1.7,<2",
+    "arch>=7.0,<8",
+    "numpyro>=0.18,<1.0",
+    "river>=0.21,<1.0",
+    "mapie>=1.4,<2",
+    "optuna>=4.6,<5",
+    "pydantic>=2.9,<3",
+    "typer>=0.12,<1",
+    "mcp>=1.0,<2",
+    "httpx>=0.27,<0.28",
+    "python-telegram-bot>=22.8,<23",
+    # Not in the addendum's table: the addendum's config/ tree is YAML and the
+    # config loader must read it. Flagged in the Task 1 report.
+    "pyyaml>=6,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-asyncio>=0.24,<1",
+    "pytest-timeout>=2.3,<3",
+    "ruff>=0.9,<1",
+]
+
+[project.scripts]
+agentoquant = "agentoquant.cli:main"
+agentoquant-mcp = "agentoquant.mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/EMZEDI/AgentoQuant"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentoquant"]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "live: opt-in tests that touch a live endpoint or a real credential (deselected by default)",
+]
+# Live tests are opt-in: `pytest -m live` runs them, the default run skips them.
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
