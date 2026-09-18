@@ -50,7 +50,7 @@ Abstract-level breakdown, revised Sept 18, 2026 (round 3: two samples on the sma
 **Acceptance criteria:**
 - [ ] One hourly snapshot completes inside every source's quota
 - [ ] A failed source is recorded as missing, and the cycle continues in hold-only mode when critical data is stale
-- [ ] Macro series present (gold, dollar proxy, conflict index), usage series present for VVV and AKT, unlock schedule present for sleeve B pairs
+- [ ] Macro series present (gold, dollar proxy, conflict index), usage series present for VVV and AKT, unlock data present where a source provides it and recorded as missing where none does (absence fails closed for sleeve C)
 
 **Verification:**
 - [ ] 24-hour dry run with zero quota breaches and a per-source call count and cost report
