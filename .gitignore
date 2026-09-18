@@ -216,3 +216,22 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------------------
+# AgentoQuant — runtime state and generated artifacts. Never commit these.
+# Root-anchored on purpose: a bare `data/` would also swallow the
+# `agentoquant/data/` package directory.
+/data/
+/logs/
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+/freqtrade_user_data/*.sqlite
+/freqtrade_user_data/*.sqlite-*
+/freqtrade_user_data/logs/
+/freqtrade_user_data/backtest_results/
+/freqtrade_user_data/hyperopt_results/
+/freqtrade_user_data/data/
+*.parquet
+artifacts/
+
