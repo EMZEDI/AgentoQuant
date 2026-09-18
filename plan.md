@@ -237,6 +237,8 @@ One installable package, one CLI (ingest, forecast, decide, paper, review, retra
 - Which OpenRouter models to pin per analyst on the Hermes small profile at launch (DeepSeek, Kimi, GLM, Gemini Flash), and whether Kimi or GLM plays the Adversary. deepseek v4.1 flash
 - Exact Kraken fee tier to assume in backtests for the first month (Tier 1 at 0.40 and 0.80 percent, or Tier 2 if 30-day volume clears $2.5k quickly). tier 2 is good
 - Whether funding requests should have a standing monthly cap so the bot cannot ask repeatedly. sure
+- Which transport serves the Sonnet-class roles (Judge, second proposal sample, Reviewer sign-off, Reflector). Recommended: OpenRouter `anthropic/claude-sonnet-5` with the project's own key, about $0.04 per Judge call and roughly $9 a month for the whole role set; alternatives are the direct Anthropic API (no key on the box) or the Claude Code CLI (not installed). Consequence for Task 16: if Sonnet arrives over OpenRouter, the `Harness` enum must be read as model family rather than transport, so one adapter serves every role.
+- Who owns the Telegram receive path. The Hermes gateway already polls the bot token with getUpdates and Telegram allows one polling consumer per token, so the project's own telegram_bot.py cannot also poll it. Recommended: the project sends through the bot API without polling, and Hermes receives the commands and passes them to the project CLI; the alternative is a dedicated bot token for the project. Blocks Task 21.
 
 ## Appendix: verified infrastructure and corrections (added 2026-09-18)
 
@@ -258,3 +260,10 @@ Everything below was checked with live calls against the runtime box and the rea
 5. **Backtest fee assumption.** Tier 2 (0.30/0.60) was chosen for the first month, but the live account sits on Tier 1 (0.40/0.80) until 30-day volume clears $2,500. The Judge and the Risk Gate already price at the live tier read from TradeVolume; the conservative choice for the first backtests is Tier 1.
 6. **Capital reality check.** The Kraken account held roughly $900 at verification (about $572 USD, 0.004 BTC and small alt balances), well below the under-$10k assumption in this plan. At that size, $100 to $200 per day is 11 to 22 percent per day rather than 1 to 2 percent, so the feasibility gate and sizing discipline matter even more than the plan states until capital is added.
 7. **Key hygiene.** The API key was first created with no permissions at all (every private call denied). After that was fixed, `WithdrawMethods` returns data, which means the key currently carries withdrawal permission. This plan's rule is trade-only keys with withdrawals disabled — turn Withdraw Funds off at pro.kraken.com/app/settings/api.
+
+**Decisions recorded 2026-09-18 (later the same day)**
+- Package name: **`agentoquant`** (the addendum's `ctagent` was a placeholder). Read every `ctagent` in `tasks/schema_scaffold_addendum.md` as `agentoquant`.
+- Integration branch is `main`; one branch per task named `task/NN-short-slug`, one worktree per parallel task under `~/work/agentoquant-wt/`. Details in `docs/HANDOFF.md`.
+- Phase 0 runs in four waves: Task 1, then Task 2, then Tasks 3 + 4 + 5 in parallel, then Task 6. Later phases derive waves from each task's `Dependencies:` line.
+- Agent operating rules live in `.hermes.md` (auto-loaded by Hermes) and `AGENTS.md` (portable); the assignment, verification and reporting protocol lives in `docs/HANDOFF.md`.
+- Telegram: the project reuses the existing Hermes bot for outbound delivery; the inbound command path is still an open question above.
