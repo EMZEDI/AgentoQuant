@@ -354,9 +354,11 @@ def test_build_listeners_filters_by_name(tmp_path: Any, monkeypatch: Any) -> Non
 
 
 def test_default_writer_and_log_stay_off_the_repo(tmp_path: Any, monkeypatch: Any) -> None:
-    env_path = scratch_ledger(tmp_path, monkeypatch).db_path
+    scratch_ledger(tmp_path, monkeypatch)
     implicit = default_writer()
-    assert implicit.store.db_path == env_path, "the env override is what keeps tests off data/ledger.duckdb"
+    assert implicit.store.db_path == tmp_path / "env-ledger.duckdb", (
+        "the env override is what keeps tests off data/ledger.duckdb"
+    )
     explicit = default_writer(db_path=tmp_path / "other.duckdb")
     assert explicit.store.db_path == tmp_path / "other.duckdb"
 
@@ -443,15 +445,14 @@ def test_restart_backoff_is_capped_and_a_crash_does_not_kill_the_runner(
     assert MAX_RESTART_BACKOFF_SECONDS >= RESTART_BACKOFF_SECONDS > 0
 
 
-def test_the_runner_close_releases_every_listener(tmp_path: Any, monkeypatch: Any) -> None:
-    store = scratch_ledger(tmp_path, monkeypatch)
+def test_the_runner_close_releases_every_listener() -> None:
     first = FakeListener("first")
     second = FakeListener("second")
     Runner([first, second]).close()
     assert first.closed is True and second.closed is True
 
 
-def test_a_listener_with_no_close_is_fine(tmp_path: Any, monkeypatch: Any) -> None:
+def test_a_listener_with_no_close_is_fine() -> None:
     class Bare:
         name = "bare"
         stats = ListenerStats()
@@ -650,7 +651,15 @@ def test_the_replay_cli_writes_the_ledger_and_prints_the_report(
     log_dir = tmp_path / "logs"
 
     code = main(
-        ["replay", "--fixtures", str(fixtures), "--db", str(store.db_path), "--log-dir", str(log_dir)]
+        [
+            "--db",
+            str(store.db_path),
+            "--log-dir",
+            str(log_dir),
+            "replay",
+            "--fixtures",
+            str(fixtures),
+        ]
     )
 
     assert code == 0
@@ -662,13 +671,13 @@ def test_the_replay_cli_writes_the_ledger_and_prints_the_report(
 
     code = main(
         [
-            "replay",
-            "--fixtures",
-            str(fixtures),
             "--db",
             str(store.db_path),
             "--log-dir",
             str(log_dir),
+            "replay",
+            "--fixtures",
+            str(fixtures),
             "--json",
         ]
     )
