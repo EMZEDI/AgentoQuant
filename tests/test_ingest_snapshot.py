@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pytest
 
-from agentoquant.config_loader import load_sources
-from agentoquant.data import ConnectorResult, SourceError, Transport
+from agentoquant.config_loader import ConfigError, load_sources
+from agentoquant.data import ConnectorResult, SourceError, Transport, TransportResponse
 from agentoquant.data.cache import Cache
 from agentoquant.data.ingest import (
     CONFIRMATION_SOURCES,
@@ -495,3 +495,88 @@ def test_the_report_type_and_its_summary_lines_are_stable(ledger, transport, quo
     assert payload["hold_only"] is False
     assert payload["symbols"] == ["BTC", "ETH"]
     assert payload["elapsed_seconds"] >= 0
+
+
+# ----------------------------------------------------------------------------------------------
+# The wiring contract: every real runner must reach its connector with matching arguments
+# ----------------------------------------------------------------------------------------------
+
+
+class PermissiveTransport:
+    """Answers every call with an empty 200 and counts the calls a runner actually made.
+
+    It exists so a runner's *wiring* is exercised with no network and no credentials. An empty body
+    is a legitimate connector failure, so connectors may reject it; what they may not do is fail
+    because the runner called them with the wrong arguments.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.cache_hits = 0
+        self.costs: dict[str, float] = {}
+        self.quota = self
+
+    def _answer(self, url: str, **kwargs) -> TransportResponse:
+        self.calls += 1
+        return TransportResponse(status_code=200, payload={}, url=url, source="test")
+
+    def get_json(self, url, **kwargs):
+        return self._answer(url, **kwargs)
+
+    def get_text(self, url, **kwargs):
+        return self._answer(url, **kwargs)
+
+    def post_json(self, url, **kwargs):
+        return self._answer(url, **kwargs)
+
+    def request(self, *args, **kwargs):
+        return self._answer(str(kwargs.get("url", "test")))
+
+    def now(self):
+        return datetime.now(UTC)
+
+    def remaining(self, source, **kwargs):
+        return 999
+
+    def acquire(self, source, **kwargs):
+        return True
+
+    def breaches(self):
+        return {}
+
+    def add_cost(self, *args, **kwargs):
+        return None
+
+    def ttl_seconds(self, source, default=0):
+        return default
+
+    def min_interval(self, source):
+        return 0.0
+
+
+@pytest.mark.parametrize("source", sorted(SOURCE_RUNNERS))
+def test_every_real_runner_reaches_its_connector(source):
+    """The regression test for the class of bug that a fake-runner suite structurally cannot see.
+
+    ``_call(connector, source, *names, **kwargs)`` takes method NAMES positionally, so an argument
+    passed positionally after the names is swallowed into the names tuple and the connector is then
+    called with no arguments at all. Four runners shipped that bug, and every one of them raised
+    TypeError the first time the real registry ran end to end. Injecting fake runners hides it
+    completely, so this test drives the real registry instead.
+
+    A missing credential or a rejected empty body is a legitimate connector outcome on a bare box,
+    so those are tolerated; a TypeError is not, and it propagates to fail the test.
+    """
+    transport = PermissiveTransport()
+    ctx = RunContext(symbols=["BTC", "ETH"], force=True)
+
+    try:
+        results = SOURCE_RUNNERS[source](transport, ctx)
+    except (SourceError, QuotaExceeded, ConfigError):
+        return
+
+    assert transport.calls >= 1, f"{source} never reached the transport"
+    assert isinstance(results, list)
+    assert results, f"{source} produced no reading at all"
+    assert all(isinstance(result, ConnectorResult) for result in results)
+    assert {result.source for result in results} == {source}

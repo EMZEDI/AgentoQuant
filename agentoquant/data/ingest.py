@@ -380,7 +380,9 @@ def run_coingecko(transport: Transport, ctx: RunContext) -> list[ConnectorResult
     results: list[ConnectorResult] = list(
         _call(connector, "coingecko", "fetch_market_global", force=ctx.force)
     )
-    results.extend(_call(connector, "coingecko", "fetch_markets", ctx.symbols, force=ctx.force))
+    results.extend(
+        _call(connector, "coingecko", "fetch_markets", symbols=ctx.symbols, force=ctx.force)
+    )
     return results
 
 
@@ -406,7 +408,7 @@ def run_defillama(transport: Transport, ctx: RunContext) -> list[ConnectorResult
     connector = connector_class(transport)
     results: list[ConnectorResult] = []
     for slug in SLEEVE_B_USAGE_SLUGS:
-        results.extend(_call(connector, "defillama", "usage_for", slug, force=ctx.force))
+        results.extend(_call(connector, "defillama", "usage_for", slug=slug, force=ctx.force))
     return results
 
 
@@ -426,7 +428,6 @@ def run_grok_x_search(transport: Transport, ctx: RunContext) -> list[ConnectorRe
         "grok_x_search",
         "fetch",
         "ticker_sentiment",
-        ctx.symbols[0] if ctx.symbols else "BTC",
         force=ctx.force,
     )
 
