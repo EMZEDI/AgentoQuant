@@ -21,7 +21,9 @@ DefiLlama, Grok X Search) degrade to a missing reading without forcing hold-only
 they never lead.
 
 **The quota manager is consulted before every call and its journal is the source of truth for the
-per-source call counts in the report.** A refused call is recorded as a breach, not swallowed.
+per-source call counts in the report.** A refused call is recorded as a breach, not swallowed, and
+the journal is the *same file* the early-signal listener runner spends from: the two processes share
+one persisted budget, so this report covers the listener sources as well as the connectors.
 
 **No credential value is ever logged, echoed or written to the ledger.** Connectors read keys
 through :func:`agentoquant.config_loader.credentials`; this module only ever sees source *names*.
@@ -616,11 +618,23 @@ def run_snapshot(
         notes=[
             f"venue={settings.venue.exchange} mode={settings.venue.mode}",
             "confirmation sources are allowed to be absent; critical sources are not",
+            f"quota: {len(quota.sources.sources)} declared sources enforced from one journal "
+            f"({quota.journal_path}), shared with the early-signal listener runner",
         ],
     )
     report.hold_only = bool(report.hold_only_reasons)
     report.record_ids = write_snapshot(ledger, resolved_cycle, outcomes)
     report.finished_at = datetime.now(UTC)
+    # A source the quota manager refused is reported with the reason it was skipped, not merely as a
+    # low call count: the refusal may have happened in the other process, and the journal carries it.
+    refusals = quota.refusals()
+    if refusals:
+        reasons = {
+            row.source: row.last_refusal_reason or "quota exhausted"
+            for row in quota.report()
+            if row.breaches
+        }
+        report.notes.append(f"quota refusals (sources skipped this window): {reasons}")
     return report
 
 

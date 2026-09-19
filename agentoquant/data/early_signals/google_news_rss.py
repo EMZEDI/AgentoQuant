@@ -35,6 +35,7 @@ from agentoquant.data.early_signals import (
     as_utc,
     utcnow,
 )
+from agentoquant.data.quota_manager import QuotaManager
 from agentoquant.enums import SourceClass
 
 BASE_URL = "https://news.google.com"
@@ -42,6 +43,9 @@ SEARCH_PATH = "/rss/search"
 
 #: Quota from config/sources.yaml: 6 calls/minute.
 CALLS_PER_MINUTE = 6
+
+#: The ``config/sources.yaml`` key every call from this listener is charged to (the shared budget).
+SOURCE = "google_news_rss"
 DEFAULT_INTERVAL_SECONDS = 300.0
 #: Query suffix per ticker. "SOL crypto" beats "SOL" for signal-to-noise; override per ticker if needed.
 DEFAULT_QUERY_SUFFIX = "crypto"
@@ -211,6 +215,7 @@ class GoogleNewsRssListener(Listener):
         query_suffix: str = DEFAULT_QUERY_SUFFIX,
         locale: str = "en-US",
         fetcher: HttpFetcher | None = None,
+        quota: QuotaManager | None = None,
         interval_seconds: float | None = None,
         log: JsonlLog | None = None,
         **kwargs: Any,
@@ -223,6 +228,8 @@ class GoogleNewsRssListener(Listener):
             base_url=BASE_URL,
             rate_limiter=RateLimiter(60.0 / CALLS_PER_MINUTE),
             max_retries=3,
+            quota=quota,
+            source=SOURCE,
         )
 
     def search(self, ticker: str) -> str:
@@ -269,6 +276,7 @@ __all__ = [
     "DEFAULT_INTERVAL_SECONDS",
     "DEFAULT_QUERY_SUFFIX",
     "SEARCH_PATH",
+    "SOURCE",
     "GoogleNewsRssListener",
     "article_times",
     "build_query",

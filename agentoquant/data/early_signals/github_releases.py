@@ -30,6 +30,7 @@ from agentoquant.data.early_signals import (
     as_utc,
     utcnow,
 )
+from agentoquant.data.quota_manager import QuotaManager
 from agentoquant.enums import SourceClass
 
 BASE_URL = "https://api.github.com"
@@ -37,6 +38,9 @@ RELEASES_PATH = "/repos/{owner}/{repo}/releases"
 
 #: Quota from config/sources.yaml: 30 calls/hour.
 CALLS_PER_HOUR = 30
+
+#: The ``config/sources.yaml`` key every call from this listener is charged to (the shared budget).
+SOURCE = "github_releases"
 DEFAULT_INTERVAL_SECONDS = 600.0
 
 #: Default repos: one public repository per sleeve B project. Verified reachable 2026-09-19
@@ -119,6 +123,7 @@ class GithubReleasesListener(Listener):
         include_prereleases: bool = True,
         token: str | None = None,
         fetcher: HttpFetcher | None = None,
+        quota: QuotaManager | None = None,
         interval_seconds: float | None = None,
         log: JsonlLog | None = None,
         **kwargs: Any,
@@ -137,6 +142,8 @@ class GithubReleasesListener(Listener):
             headers=headers,
             rate_limiter=RateLimiter(3600.0 / CALLS_PER_HOUR),
             max_retries=3,
+            quota=quota,
+            source=SOURCE,
         )
 
     def poll(self) -> list[SignalEvent]:
@@ -177,6 +184,7 @@ __all__ = [
     "DEFAULT_INTERVAL_SECONDS",
     "DEFAULT_REPOS",
     "RELEASES_PATH",
+    "SOURCE",
     "GithubReleasesListener",
     "parse_github_releases",
 ]

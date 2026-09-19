@@ -43,6 +43,7 @@ from agentoquant.data.early_signals import (
     single_ticker,
     utcnow,
 )
+from agentoquant.data.quota_manager import QuotaManager
 from agentoquant.enums import SourceClass
 
 BASE_URL = "https://t.me"
@@ -50,6 +51,9 @@ PREVIEW_PATH = "/s/{channel}"
 
 #: Quota from config/sources.yaml: 6 calls/minute.
 CALLS_PER_MINUTE = 6
+
+#: The ``config/sources.yaml`` key every call from this listener is charged to (the shared budget).
+SOURCE = "telegram_previews"
 DEFAULT_INTERVAL_SECONDS = 60.0
 
 #: Channels with a working public preview, verified 2026-09-19. Kraken's and OKX's announcement
@@ -194,6 +198,7 @@ class TelegramPreviewsListener(Listener):
         *,
         channels: tuple[str, ...] | None = None,
         fetcher: HttpFetcher | None = None,
+        quota: QuotaManager | None = None,
         interval_seconds: float | None = None,
         log: JsonlLog | None = None,
         **kwargs: Any,
@@ -204,6 +209,8 @@ class TelegramPreviewsListener(Listener):
             base_url=BASE_URL,
             rate_limiter=RateLimiter(60.0 / CALLS_PER_MINUTE),
             max_retries=3,
+            quota=quota,
+            source=SOURCE,
         )
 
     def poll(self) -> list[SignalEvent]:
@@ -236,6 +243,7 @@ __all__ = [
     "DEFAULT_CHANNELS",
     "DEFAULT_INTERVAL_SECONDS",
     "PREVIEW_PATH",
+    "SOURCE",
     "TelegramPreviewsListener",
     "classify_event_type",
     "parse_telegram_preview",

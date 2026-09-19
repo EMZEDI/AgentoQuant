@@ -12,10 +12,10 @@ where something could not be verified it says so instead of guessing.
 | 2 | Fourteen-stage decision ledger in DuckDB, named queries, cost meter | 14 tables; `ledger query --query cycles` returns 4 cycles with 14/12/13/14 stages; field-name drift against addendum §4–6: 0 |
 | 3 | Quota manager, cache, seven connectors, hourly snapshot orchestrator | Live snapshot across every source; four positional-argument wiring bugs found and fixed with a regression test that drives the real registry |
 | 4 | Early-signal listeners (Bybit, OKX, Kraken, GitHub releases, Google News RSS, Telegram previews, on-chain webhooks) and a runner | Live 90 s run: 892 events, 0 failures, 0 restarts, every record carrying a `source_class`; per-module suites now total 178 tests, and each of the three acceptance criteria is verified **by mutation** — revert the behaviour, watch the test fail |
-| 5 | Deterministic Risk Gate (23 rules), kill switch, funding floor | 18/18 acceptance checks against a real ledger; 27 adversarial tests, one case per rule |
+| 5 | Deterministic Risk Gate (27 rules), kill switch, funding floor | 18/18 acceptance checks against a real ledger; 36 adversarial tests, 27 cases (one per rule) |
 | 6 | Paper harness, freqtrade dry-run bridge, order manager for the twelve-action vocabulary, signal store, Telegram notifier, scheduler, systemd units | 24 consecutive cycles, 0 failures, three real dry-run trades each tagged with its cycle id |
 
-Gate on `main`: **376 tests pass, 1 skipped (opt-in live cost check), ruff clean.**
+Gate on `main`: **461 tests pass, 1 skipped (opt-in live cost check), ruff clean.**
 
 ## The loop is running unattended
 
@@ -131,6 +131,42 @@ work.
 | F17 MCP name spelling; two stale numbers | low | **fixed** — the underscore mapping is now asserted as a stated deviation, and the two stale counts (22 rules, 133 tests) were corrected to 23 and 27 |
 | F18 the fee floor is the maker rate, so stops are simulated 0.4% cheap | medium | phase agent (documented, not fixed) |
 | F6 the soak evidence was nine identical cycles | medium | **fixed** (rotation, `tests/test_paper_sequence.py`) |
+
+## Fix round 1 — merged
+
+| Finding | Result |
+|---|---|
+| F7 severity-5 objection approved | **fixed** — `RULE_UNRESOLVED_SEVERITY5` in the reject set; a malformed objection fails closed. Verified independently: a severity-5 objection now returns `rejected unresolved_severity5_objection` |
+| F8 gate pass-through for seven actions | **fixed** — 7 of 12 passing through is now 0 of 12; reductions get `reduction_cap`, hold `hold_size_zero`, management rules of their own. Verified independently: `hold` now returns `shrunk hold_size_zero` at 0.0 |
+| F11 no staleness detection | **fixed in the gate** — `MarketContext.as_of`/`is_stale` plus a caller-declared max age. Verified independently: a 3-hour-old snapshot with a 2-hour limit returns `rejected stale_market_data`. Caller wiring still open (below) |
+| F12 dead config keys, rule count | **fixed** — sleeve cap is now `min(sleeves.yaml, risk_limits.yaml)`, `min_concurrent` is read, and a drift test pins the documented 27 rules against the code |
+| F14 early signals bypass the quota manager | **fixed** — every attempt is reserved against the one authority *before* the socket; a refusal raises a `FetchError` subclass so each listener's existing skip-and-log path handles it; `quota_audit()` names any fetcher that would fetch unbudgeted and returns `[]` |
+| F15 quota accounting is per process | **fixed** — the journal file **is** the budget, reads re-check `(mtime_ns, size)` and `acquire` holds an exclusive `flock` across read-check-append. Reproduced first: a spend in one process was invisible to the other, and 12 of the 15 new tests fail on the pre-fix code |
+| F3 `outcome` stage has no writer | **fixed** — `agentoquant/ledger/outcomes.py`, idempotent and horizon-aware, covering executed, rejected and vetoed proposals, with `python -m agentoquant.ledger.outcomes` and a scheduler hook. Caller wiring still open (below) |
+| F2 two verdict rows per cycle | **fixed** — natural keys per stage; an identical repeat returns the stored id and inserts nothing. A *conflicting* payload under the same key is still written, which is deliberate |
+| F9 Ontario net-buy cap inert | **partially** — the cap's own path is now proven with a real fill (reject at the cap, shrink with headroom, exempt coins audited not counted, 400-day-old fills out of window, and the real loop rejects a buy over the cap when the ledger has a fill). It stays inert on live data until F1 lands |
+
+### Verified constraints
+
+- **DuckDB cannot be opened by two processes.** Confirmed on this box: a second process gets
+  `IO Error: Could not set lock on file ... Conflicting lock is held`. So the quota budget lives in a
+  JSONL journal with `flock` rather than in the ledger. **Consequence for the soak:** if the
+  early-signal runner is ever run as a long-lived service holding `data/ledger.duckdb`, the hourly
+  `agentoquant ingest` process will fail to open the ledger. Today only the paper loop and the venue
+  run, so nothing collides — but this must be settled before the runner becomes a service.
+- **F8 deviation, accepted.** The risk-gate agent declined to put the halt rules on the *management*
+  actions, so a halt cannot block placing a stop. That is the right direction: a test pins it
+  (`test_reductions_and_hold_are_never_blocked_by_a_halt`). Recorded here so it is a decision, not an
+  oversight.
+
+### Still open after this round
+
+- **Caller wiring for F11 and F3**, both one line in `agentoquant/execution/paper.py`, which the
+  execution agent owns: pass `as_of=now` into the placeholder market context, and call
+  `record_due_outcomes(ledger, as_of=moment)` after orders are submitted. Until then the gate can
+  detect staleness but the Phase 0 loop cannot make it stale, and the outcome recorder exists but
+  nothing calls it.
+- **F1, F4, F5, F10, F13** are fixed on the execution branch and pending merge review.
 
 ## Next
 

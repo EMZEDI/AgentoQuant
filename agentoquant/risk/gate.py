@@ -35,8 +35,11 @@ Book
                             ``funding.free_cash_floor_pct`` is a percent of that sleeve's *target*,
                             so the gate converts it: ``floor_pct_of_book = floor_pct * cap_pct /
                             100`` using the sleeve's ``cap_pct`` from ``config/sleeves.yaml``.
-    ``markets``             per-coin market state: 24h quote volume, spread and whether the pair is
-                            tradable at all. A coin that is absent fails closed (``min_liquidity``).
+    ``markets``             per-coin market state: 24h quote volume, spread, whether the pair is
+                            tradable at all, and how fresh the snapshot is (``as_of``, ``is_stale``).
+                            A coin that is absent fails closed (``min_liquidity``); a snapshot that
+                            missed a whole cadence fails closed (``stale_market_data``). Staleness
+                            stops new exposure only: it never blocks a reduction.
 
 Risk budget used today
     ``daily_turnover_used_pct``, ``daily_loss_used_pct``, ``drawdown_used_pct``,
@@ -73,9 +76,25 @@ Halts and clock
 Only shrink or reject
 ---------------------
 :meth:`RiskGate.evaluate` clamps the final size into ``[0, original_size_pct]`` before returning, so
-no combination of inputs can enlarge a proposal. ``INCREASING_ACTIONS`` are the only actions that
-can be shrunk or rejected; ``trim``/``exit``/``hold`` and the stop-management actions pass through
-unchanged (still clamped).
+no combination of inputs can enlarge a proposal.
+
+All twelve vocabulary actions are evaluated by at least one rule that can shrink or reject them;
+none of them is a pass-through. Which rules apply to which action:
+
+``INCREASING_ACTIONS`` (``enter_laddered``, ``add``, ``event_trade``, ``rotate``, ``rebalance``)
+    every reject rule in ``REJECT_RULES``, then every shrink cap in ``SHRINK_RULES``.
+``REDUCING_ACTIONS`` (``trim``, ``exit``)
+    never blocked by a halt or by stale market data - a halt closes positions and freezing one is
+    the opposite of what it is for - but they must name a coin (``incomplete_card``), must ask for
+    a positive size (``missing_size``), and can never reduce more than the position the context
+    reports (``reduction_cap``).
+``Action.HOLD``
+    a no-op, approved at size 0.0 whatever size the card carries (``hold_size_zero``), so a
+    nonsensical size on a hold is never published as an approved size.
+stop and order management (``set_stop``, ``trail_stop``, ``take_profit_ladder``, ``cancel_order``)
+    also never blocked by a halt, but they must name a coin (``incomplete_card``), need a venue that
+    is ``online`` (``venue_status``), and a stop-management card must carry the stop it manages
+    (``missing_stop``).
 """
 
 from __future__ import annotations
@@ -104,6 +123,7 @@ from agentoquant.risk.kill_switch import HaltState
 RULE_UNSUPPORTED_ACTION = "unsupported_action"
 RULE_MISSING_SIZE = "missing_size"
 RULE_INCOMPLETE_CARD = "incomplete_card"
+RULE_UNRESOLVED_SEVERITY5 = "unresolved_severity5_objection"
 RULE_KILL_SWITCH_FLAT = "kill_switch_flat"
 RULE_DAILY_LOSS_HALT = "daily_loss_halt"
 RULE_WEEKLY_DRAWDOWN_HALT = "weekly_drawdown_halt"
@@ -115,6 +135,7 @@ RULE_CONFIDENCE_BAND_NO_TRADE = "confidence_band_no_trade"
 RULE_ENTRY_CONFIDENCE = "entry_confidence_below_sleeve_threshold"
 RULE_MISSING_STOP = "missing_stop"
 RULE_POST_ONLY_REQUIRED = "post_only_required"
+RULE_STALE_MARKET_DATA = "stale_market_data"
 RULE_NOT_TRADABLE = "not_tradable"
 RULE_MIN_LIQUIDITY = "min_liquidity"
 RULE_MAX_SPREAD = "max_spread"
@@ -126,12 +147,15 @@ RULE_FREE_CASH_FLOOR = "free_cash_floor"
 RULE_POSITION_CAP = "position_cap"
 RULE_SLEEVE_CAP = "sleeve_cap"
 RULE_FREE_CASH = "free_cash"
+RULE_REDUCTION_CAP = "reduction_cap"
+RULE_HOLD_SIZE_ZERO = "hold_size_zero"
 
 #: Every rule name this module can fire, in evaluation priority order.
 REJECT_RULES: tuple[str, ...] = (
     RULE_UNSUPPORTED_ACTION,
     RULE_MISSING_SIZE,
     RULE_INCOMPLETE_CARD,
+    RULE_UNRESOLVED_SEVERITY5,
     RULE_KILL_SWITCH_FLAT,
     RULE_DAILY_LOSS_HALT,
     RULE_WEEKLY_DRAWDOWN_HALT,
@@ -143,6 +167,7 @@ REJECT_RULES: tuple[str, ...] = (
     RULE_ENTRY_CONFIDENCE,
     RULE_MISSING_STOP,
     RULE_POST_ONLY_REQUIRED,
+    RULE_STALE_MARKET_DATA,
     RULE_NOT_TRADABLE,
     RULE_MIN_LIQUIDITY,
     RULE_MAX_SPREAD,
@@ -151,7 +176,13 @@ REJECT_RULES: tuple[str, ...] = (
     RULE_FREE_CASH_FLOOR,
 )
 
-SHRINK_RULES: tuple[str, ...] = (RULE_POSITION_CAP, RULE_SLEEVE_CAP, RULE_FREE_CASH)
+SHRINK_RULES: tuple[str, ...] = (
+    RULE_POSITION_CAP,
+    RULE_SLEEVE_CAP,
+    RULE_FREE_CASH,
+    RULE_REDUCTION_CAP,
+    RULE_HOLD_SIZE_ZERO,
+)
 
 ALL_RULES: tuple[str, ...] = REJECT_RULES + SHRINK_RULES
 
@@ -161,12 +192,17 @@ VERDICT_SHRUNK = "shrunk"
 VERDICT_REJECTED = "rejected"
 
 #: Actions that increase risk and therefore face every entry rule. ``rotate`` and ``rebalance`` move
-#: value into a sleeve, so they are checked like an entry; ``trim`` and ``exit`` only reduce exposure
-#: and are never blocked by a halt (a halt closes positions, it does not freeze them).
+#: value into a sleeve, so they are checked like an entry.
 INCREASING_ACTIONS: frozenset[Action] = frozenset(
     {Action.ENTER_LADDERED, Action.ADD, Action.EVENT_TRADE, Action.ROTATE, Action.REBALANCE}
 )
+#: ``trim`` and ``exit`` only reduce exposure. They are never blocked by a halt (a halt closes
+#: positions, it does not freeze them) and never blocked by stale data, but they are bounded by the
+#: position they reduce and must name a coin and a size. See :meth:`RiskGate._evaluate_reducing`.
 REDUCING_ACTIONS: frozenset[Action] = frozenset({Action.TRIM, Action.EXIT})
+#: A no-op and the size-free order management. Neither is a pass-through: ``hold`` is approved at
+#: size 0.0, and the management actions must name a coin, need an online venue and (for the stop
+#: actions) carry the stop they manage. See :meth:`RiskGate._evaluate_management`.
 NEUTRAL_ACTIONS: frozenset[Action] = frozenset(
     {
         Action.HOLD,
@@ -175,6 +211,10 @@ NEUTRAL_ACTIONS: frozenset[Action] = frozenset(
         Action.TRAIL_STOP,
         Action.TAKE_PROFIT_LADDER,
     }
+)
+#: The management actions that manage a stop, and therefore must carry one.
+STOP_MANAGEMENT_ACTIONS: frozenset[Action] = frozenset(
+    {Action.SET_STOP, Action.TRAIL_STOP, Action.TAKE_PROFIT_LADDER}
 )
 
 #: Assets exempt from Ontario's net-buy cap (CSA rules exclude BTC, ETH, LTC and BCH).
@@ -231,6 +271,12 @@ class MarketContext:
     volume_24h_usd: float = 0.0
     spread_pct: float = 0.0
     tradable: bool = True
+    #: When the snapshot behind these numbers was taken. ``None`` means the caller did not say, and
+    #: the gate will not invent a timestamp: an age it cannot know is not called stale.
+    as_of: datetime | None = None
+    #: The raw snapshot's own staleness flag (``RawSnapshotPayload.is_stale``), carried through so
+    #: the gate sees what the ingest stage already knew.
+    is_stale: bool = False
 
 
 @dataclass(frozen=True)
@@ -243,6 +289,9 @@ class PortfolioContext:
     sleeve_weights_pct: Mapping[Sleeve, float] = field(default_factory=dict)
     free_cash_pct_by_sleeve: Mapping[Sleeve, float] = field(default_factory=dict)
     markets: Mapping[str, MarketContext] = field(default_factory=dict)
+    #: Override for how old a market snapshot may be before the gate refuses to act on it; ``None``
+    #: uses one cadence plus a margin, derived from ``settings.cadence_minutes``.
+    market_data_max_age_s: float | None = None
 
     # Risk budget used today
     daily_turnover_used_pct: float = 0.0
@@ -297,6 +346,52 @@ class PortfolioContext:
 
     def free_cash(self, sleeve: Sleeve) -> float:
         return float(self.free_cash_pct_by_sleeve.get(sleeve, 0.0))
+
+
+# ----------------------------------------------------------------------------------------------
+# Freshness: the gate will not reason about an old snapshot as if it were a new one
+# ----------------------------------------------------------------------------------------------
+
+#: How many decision cadences a market snapshot stays usable for. One cadence plus a full margin: a
+#: snapshot that missed a whole cycle is history, not a market.
+STALE_MARKET_DATA_CADENCES = 2.0
+
+
+def default_market_data_max_age_s() -> float:
+    """``STALE_MARKET_DATA_CADENCES`` x ``settings.cadence_minutes``, in seconds.
+
+    Read from ``config/settings.yaml`` (60 minutes) rather than invented here, so the staleness
+    limit follows the cadence: a faster cadence makes the limit tighter, never looser.
+    """
+    try:
+        minutes = float(load_settings().cadence_minutes)
+    except Exception:  # pragma: no cover - a broken config is a startup failure elsewhere
+        minutes = 60.0
+    return max(1.0, minutes) * 60.0 * STALE_MARKET_DATA_CADENCES
+
+
+def _as_utc(moment: datetime) -> datetime:
+    """A datetime with a timezone, assuming UTC when the caller did not say."""
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def market_data_is_stale(
+    market: MarketContext, *, now: datetime, max_age_s: float, strict: bool = False
+) -> bool:
+    """Whether the market state is too old to act on.
+
+    The raw snapshot's own ``is_stale`` flag wins outright. With no ``as_of`` the age is unknown,
+    and the gate will not invent a timestamp, so an unknown age is stale only under ``strict`` -
+    which the caller turns on by declaring a ``market_data_max_age_s`` of its own, i.e. by saying
+    that its snapshots do carry timestamps. Phase 0's placeholder loop populates neither yet; the
+    ingest snapshot carries ``is_stale``, and Phase 2's brief is the caller that passes both in.
+    """
+    if market.is_stale:
+        return True
+    if market.as_of is None:
+        return bool(strict)
+    age_s = (_as_utc(now) - _as_utc(market.as_of)).total_seconds()
+    return age_s > float(max_age_s)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -365,12 +460,43 @@ def _non_negative(value: float | None) -> float:
     return max(0.0, float(value))
 
 
+#: The severity at which an adversary objection blocks a new trade outright. ``plan.md``:
+#: "act only if ... and no unresolved severity-5 objection remains", and Task 20's acceptance
+#: criterion repeats it ("no trade when EV after fees is not positive by margin or a severity-5
+#: objection is unresolved").
+UNRESOLVED_OBJECTION_SEVERITY = 5
+
+
+def objection_severity(card: DecisionCard) -> int:
+    """The card's strongest objection severity, or 0 when the card carries none.
+
+    A card whose objection is present but carries no usable ``severity`` fails closed: it is
+    reported at the blocking severity, because the gate cannot tell a broken objection from a
+    serious one, and "unresolved" is the safe reading of an objection it cannot parse.
+    """
+    objection = card.strongest_objection
+    if objection is None:
+        return 0
+    if isinstance(objection, Mapping):
+        raw = objection.get("severity")
+    else:
+        raw = getattr(objection, "severity", None)
+    if raw is None:
+        return UNRESOLVED_OBJECTION_SEVERITY
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return UNRESOLVED_OBJECTION_SEVERITY
+
+
 class RiskGate:
     """Deterministic limits. It can shrink or reject a proposal, never enlarge it.
 
-    ``limits`` comes from ``config_risk_limits.yaml`` via ``load_risk_limits()``; the sleeve caps and
-    entry-confidence thresholds come from ``config/sleeves.yaml`` via ``load_sleeves()``, loaded once
-    at construction. ``ledger`` is optional: with it, every verdict and every funding request is
+    ``limits`` comes from ``config/risk_limits.yaml`` via ``load_risk_limits()``; the entry-confidence
+    thresholds come from ``config/sleeves.yaml`` via ``load_sleeves()``, loaded once at construction.
+    A sleeve's cap is the **tighter** of ``sleeves.yaml``'s ``cap_pct`` and ``risk_limits.yaml``'s
+    ``positions.sleeve_caps_pct``: neither file can silently loosen the other, and no key in the
+    limits file is dead. ``ledger`` is optional: with it, every verdict and every funding request is
     written; without it the gate still returns the same verdict and writes nothing.
     """
 
@@ -378,6 +504,7 @@ class RiskGate:
         self.limits = limits
         self.ledger = ledger
         self.sleeves: Sleeves = load_sleeves()
+        self.max_market_data_age_s = default_market_data_max_age_s()
 
     # -- public API ----------------------------------------------------------------------------
 
@@ -397,11 +524,27 @@ class RiskGate:
                 card, context, VERDICT_REJECTED, RULE_UNSUPPORTED_ACTION, original, 0.0, False
             )
 
-        if action not in INCREASING_ACTIONS:
-            # Reductions and stop management: never enlarged, never blocked by a halt (a halt closes
-            # positions; freezing them would be the opposite of what it is for).
-            return self._verdict(card, context, VERDICT_APPROVED, None, original, original, False)
+        if action in INCREASING_ACTIONS:
+            return self._evaluate_increasing(card, context, action, original, now)
+        if action in REDUCING_ACTIONS:
+            return self._evaluate_reducing(card, context, action, original)
+        if action is Action.HOLD:
+            return self._evaluate_hold(card, context, original)
+        # Everything left is stop or order management. It carries no size the executor uses, so it
+        # is never shrunk for size; it is checked against the card, the venue and its own stop.
+        return self._evaluate_management(card, context, action, original)
 
+    # -- one path per action class -------------------------------------------------------------
+
+    def _evaluate_increasing(
+        self,
+        card: DecisionCard,
+        context: PortfolioContext,
+        action: Action,
+        original: float,
+        now: datetime,
+    ) -> RiskGateVerdict:
+        """An entry, add, event trade, rotate or rebalance: every entry rule applies."""
         rejection = self._first_rejection(card, context, action, original, now)
         if rejection is not None:
             rule, breach, shortfall_pct = rejection
@@ -434,6 +577,91 @@ class RiskGate:
         verdict = VERDICT_SHRUNK if size < original else VERDICT_APPROVED
         return self._verdict(card, context, verdict, rule_fired, original, size, breach)
 
+    def _evaluate_reducing(
+        self,
+        card: DecisionCard,
+        context: PortfolioContext,
+        action: Action,
+        original: float,
+    ) -> RiskGateVerdict:
+        """``trim``/``exit``: a reduction is never blocked, but it is still bounded.
+
+        A halt closes positions and a stale snapshot does not make a position safer to hold, so
+        neither one blocks a reduction. What a reduction may not do is name no coin, ask for no
+        size, or ask to reduce more than the position the context reports. That position is the only
+        bound the gate can verify: when the context does not name the coin at all the size is left
+        alone, because the gate will not guess at a position it cannot see, and refusing to reduce
+        is the one failure mode worth avoiding.
+        """
+        del action
+        if card.coin is None:
+            return self._verdict(
+                card, context, VERDICT_REJECTED, RULE_INCOMPLETE_CARD, original, 0.0, False
+            )
+        if original <= 0.0:
+            return self._verdict(
+                card, context, VERDICT_REJECTED, RULE_MISSING_SIZE, original, 0.0, False
+            )
+        held = context.position_for(card.coin)
+        if held is None:
+            return self._verdict(card, context, VERDICT_APPROVED, None, original, original, False)
+        cap = max(0.0, float(held.size_pct))
+        if cap <= 0.0:
+            return self._verdict(
+                card, context, VERDICT_REJECTED, RULE_REDUCTION_CAP, original, 0.0, False
+            )
+        if cap < original:
+            return self._verdict(
+                card, context, VERDICT_SHRUNK, RULE_REDUCTION_CAP, original, cap, False
+            )
+        return self._verdict(card, context, VERDICT_APPROVED, None, original, original, False)
+
+    def _evaluate_hold(
+        self, card: DecisionCard, context: PortfolioContext, original: float
+    ) -> RiskGateVerdict:
+        """``hold``: a no-op, approved at size 0.0 whatever size the card carries.
+
+        A hold places nothing, so echoing the card's size back as an approved ``final_size_pct``
+        publishes a size for an action that has none - and the executor takes its size from the
+        verdict. A hold that carries a size is therefore shrunk to zero.
+        """
+        if original <= 0.0:
+            return self._verdict(card, context, VERDICT_APPROVED, None, original, 0.0, False)
+        return self._verdict(
+            card, context, VERDICT_SHRUNK, RULE_HOLD_SIZE_ZERO, original, 0.0, False
+        )
+
+    def _evaluate_management(
+        self,
+        card: DecisionCard,
+        context: PortfolioContext,
+        action: Action,
+        original: float,
+    ) -> RiskGateVerdict:
+        """``set_stop``, ``trail_stop``, ``take_profit_ladder``, ``cancel_order``.
+
+        Stop and order management is part of closing a position, so a halt does not block it. It
+        must still name the coin it manages, and it needs a venue that is ``online``: an order
+        handed to a venue in maintenance is an order that silently does nothing.
+        """
+        if card.coin is None:
+            return self._verdict(
+                card, context, VERDICT_REJECTED, RULE_INCOMPLETE_CARD, original, 0.0, False
+            )
+        if context.venue_status != VENUE_STATUS_OK:
+            return self._verdict(
+                card, context, VERDICT_REJECTED, RULE_VENUE_STATUS, original, 0.0, False
+            )
+        if (
+            action in STOP_MANAGEMENT_ACTIONS
+            and not context.stop_on_exchange
+            and context.stop_price is None
+        ):
+            return self._verdict(
+                card, context, VERDICT_REJECTED, RULE_MISSING_STOP, original, 0.0, False
+            )
+        return self._verdict(card, context, VERDICT_APPROVED, None, original, original, False)
+
     # -- rejections ----------------------------------------------------------------------------
 
     def _first_rejection(
@@ -453,6 +681,13 @@ class RiskGate:
             return RULE_MISSING_SIZE, False, 0.0
         if coin is None or sleeve is None:
             return RULE_INCOMPLETE_CARD, False, 0.0
+
+        if objection_severity(card) >= UNRESOLVED_OBJECTION_SEVERITY:
+            # The adversary's own strongest objection is on the card, and Phase 0 has no Judge
+            # stage to resolve it. plan.md lets an entry act only while no unresolved severity-5
+            # objection remains, so the gate refuses it here rather than trusting a stage that
+            # does not exist yet. It blocks new exposure only: a reduction is never blocked.
+            return RULE_UNRESOLVED_SEVERITY5, False, 0.0
 
         halts = context.halts
         if halts.flat:
@@ -495,6 +730,15 @@ class RiskGate:
         if market is None:
             # No market state means no way to check liquidity or spread: fail closed.
             return RULE_MIN_LIQUIDITY, False, 0.0
+        if market_data_is_stale(
+            market,
+            now=now,
+            max_age_s=self._market_data_max_age_s(context),
+            strict=context.market_data_max_age_s is not None,
+        ):
+            # A snapshot that missed a whole cadence is history, not a market, and good numbers from
+            # an old snapshot are exactly the stale-data attack this rule exists to stop.
+            return RULE_STALE_MARKET_DATA, False, 0.0
         if not market.tradable:
             return RULE_NOT_TRADABLE, False, 0.0
         if market.volume_24h_usd < limits.liquidity.min_24h_volume_usd:
@@ -515,6 +759,12 @@ class RiskGate:
             return RULE_FREE_CASH_FLOOR, True, shortfall
 
         return None
+
+    def _market_data_max_age_s(self, context: PortfolioContext) -> float:
+        """The staleness limit: the context's override, else one cadence plus a margin."""
+        if context.market_data_max_age_s is not None:
+            return max(0.0, float(context.market_data_max_age_s))
+        return self.max_market_data_age_s
 
     def _cooldown_active(self, context: PortfolioContext, now: datetime) -> bool:
         """Two consecutive losses start a cooldown. An unknown ``last_loss_at`` stays active."""
@@ -571,14 +821,20 @@ class RiskGate:
 
         sleeve_spec = self.sleeves.get(sleeve) if sleeve is not None else None
         per_position_cap = self.limits.positions.max_position_pct
-        if sleeve_spec is not None:
-            per_position_cap = min(per_position_cap, sleeve_spec.position_cap_pct)
+        if sleeve is not None and sleeve_spec is not None:
+            per_position_cap = min(
+                per_position_cap,
+                sleeve_spec.position_cap_pct,
+                self._diversification_cap_pct(sleeve),
+            )
         existing = context.position_for(coin)
         held = existing.size_pct if existing is not None else 0.0
         caps.append((RULE_POSITION_CAP, per_position_cap - held))
 
         if sleeve is not None and sleeve_spec is not None:
-            caps.append((RULE_SLEEVE_CAP, sleeve_spec.cap_pct - context.sleeve_weight(sleeve)))
+            caps.append(
+                (RULE_SLEEVE_CAP, self._sleeve_cap_pct(sleeve) - context.sleeve_weight(sleeve))
+            )
 
         caps.append((RULE_ONTARIO_NET_BUY_CAP, self._ontario_headroom_pct(context, coin, original)))
         caps.append((RULE_FREE_CASH, self._free_cash_headroom(card, context)))
@@ -600,6 +856,32 @@ class RiskGate:
         if remaining_cad <= 0.0:
             return 0.0
         return remaining_cad / context.book_value_cad * 100.0
+
+    def _sleeve_cap_pct(self, sleeve: Sleeve) -> float:
+        """The sleeve's cap: the tighter of ``sleeves.yaml`` and ``risk_limits.yaml``.
+
+        Both files state a cap. ``config/sleeves.yaml``'s ``cap_pct`` is the sleeve's target
+        allocation; ``config/risk_limits.yaml``'s ``positions.sleeve_caps_pct`` is the same limit
+        stated in the file named for limits, and the gate used to ignore it entirely, so editing it
+        changed nothing. Taking the tighter of the two means a change to either file binds, and a
+        loosening in one can never enlarge what the other permits.
+        """
+        from_sleeves = float(self.sleeves.get(sleeve).cap_pct)
+        from_limits = self.limits.positions.sleeve_caps_pct.get(sleeve)
+        if from_limits is None:
+            return from_sleeves
+        return min(from_sleeves, float(from_limits))
+
+    def _diversification_cap_pct(self, sleeve: Sleeve) -> float:
+        """The equal share of its sleeve that a single position may take.
+
+        ``positions.min_concurrent`` ("3 to 5 concurrent positions") is the number of positions the
+        book is meant to spread across, so one position may take at most
+        ``sleeve_cap / min_concurrent``. This is the shrink-only reading of the key: raising
+        ``min_concurrent`` tightens the cap, and it can never loosen a position limit.
+        """
+        count = max(1, int(self.limits.positions.min_concurrent))
+        return self._sleeve_cap_pct(sleeve) / float(count)
 
     def _free_cash_headroom(self, card: DecisionCard, context: PortfolioContext) -> float:
         """Free cash above the sleeve's floor, in percent of book value."""
@@ -691,6 +973,7 @@ __all__ = [
     "RULE_DAILY_TURNOVER_CAP",
     "RULE_ENTRY_CONFIDENCE",
     "RULE_FREE_CASH",
+    "RULE_HOLD_SIZE_ZERO",
     "RULE_FREE_CASH_FLOOR",
     "RULE_INCOMPLETE_CARD",
     "RULE_KILL_SWITCH_FLAT",
@@ -702,19 +985,27 @@ __all__ = [
     "RULE_NOT_TRADABLE",
     "RULE_ONTARIO_NET_BUY_CAP",
     "RULE_POSITION_CAP",
+    "RULE_REDUCTION_CAP",
     "RULE_POST_ONLY_REQUIRED",
     "RULE_SLEEVE_CAP",
     "RULE_SLEEVE_DISABLED",
+    "RULE_STALE_MARKET_DATA",
     "RULE_UNSUPPORTED_ACTION",
     "RULE_VENUE_STATUS",
     "RULE_WEEKLY_DRAWDOWN_HALT",
     "RiskGate",
     "SELL_ACTIONS",
     "SHRINK_RULES",
+    "STALE_MARKET_DATA_CADENCES",
+    "STOP_MANAGEMENT_ACTIONS",
+    "UNRESOLVED_OBJECTION_SEVERITY",
     "VENUE_STATUSES",
     "VENUE_STATUS_OK",
     "VERDICT_APPROVED",
     "VERDICT_REJECTED",
     "VERDICT_SHRUNK",
+    "default_market_data_max_age_s",
+    "market_data_is_stale",
+    "objection_severity",
     "ontario_net_buys_cad_12m",
 ]
