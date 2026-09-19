@@ -66,8 +66,11 @@ DEFAULT_QUOTE_FILTER: frozenset[str] = frozenset(
     {"ZUSD", "USD", "USDT", "USDC", "ZEUR", "EUR", "ZCAD", "CAD"}
 )
 
-#: Kraken's legacy asset codes, normalized to the ticker the rest of the system uses.
-ASSET_ALIASES: dict[str, str] = {"XBT": "BTC", "XDG": "DOGE"}
+#: Kraken's legacy asset codes, normalized to the ticker the rest of the system uses. Both spellings are
+#: needed: ``AssetPairs`` returns the ``X``-prefixed code in its ``base`` field (``XXBT``) and the plain
+#: one in ``wsname`` (``XBT``). Without the prefixed forms the fallback path below would write a Kraken
+#: code into the ledger's ``ticker`` column. Found by tests/test_early_kraken.py.
+ASSET_ALIASES: dict[str, str] = {"XBT": "BTC", "XXBT": "BTC", "XDG": "DOGE", "XXDG": "DOGE"}
 
 #: RSS categories that mark a listing announcement.
 LISTING_CATEGORIES: frozenset[str] = frozenset({"asset listings", "asset listing"})
