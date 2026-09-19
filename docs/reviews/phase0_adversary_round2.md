@@ -1239,4 +1239,102 @@ that quota spending is metered and reported.
 and add a refusal-throttle so a persistently exhausted source writes one refusal line per window rather
 than one per attempt.
 
+---## Can Phase 0's checkpoint be signed off?
+
+**No. Not as stated.** The fix round did real work — 15 of the 18 round-1 findings are genuinely
+addressed, two more are addressed in their mechanism and honestly declared as gaps, and the evidence I
+produced for F2, F3, F4, F7, F8, F9, F14 and F15 is stronger than round 1's was, because I could run
+those paths against the live venue and against real multi-process runs. The gate's never-enlarge
+invariant still holds (540 verdicts, zero enlargements). The one finding that was rated a blocker,
+however, is still not closed, and the checkpoint names it.
+
+Clause by clause:
+
+| Clause | Verdict | Basis |
+|---|---|---|
+| A trivial strategy runs the full hourly loop in paper mode | **Verified, thinly** | 11 genuine timer ticks, exit 0, one JSON line each, and the rotation now advances between ticks (`14Z` add, `15Z` exit). The loop still exercises three of the twelve vocabulary actions |
+| Post-only orders | **Verified in effect, not enforced** | the entry limit sits below the market and `post_only` is carried on the intent and the document, but no REST call can carry it; ladders are priced by the bridge from the venue's own rate plus published offsets (F5's ladder half, fixed) |
+| Stops on the exchange | **Verified** | the venue's own state holds a resting stop on the open trade; `stoploss_on_exchange` is set in both the strategy and the config |
+| Every cycle in the ledger | **Verified** | one verdict row per decision card (22 rows for 12 cards, the split falling exactly at the fix), one execution row per placed intent, one card per cycle |
+| Every token in the ledger | **Improved, not complete** | the `outcome` stage now has 17 live rows where it had none, and the other empty stages are genuinely Phase 0's (no cascade, no LLM). This clause is now about later phases rather than about a missing writer |
+| Cost per cycle measured | **Not satisfied** | the only live per-cycle cost rows are nine `unfilled_timeout` rows with `fee_paid=None`; the write-back that would fill them is fixed but has never been exercised by a live fill. The fee the ledger would write is also not the fee the venue charges (B9) |
+| No API quota breaches | **Verified** | every listener reserves from the one authority before the socket, refusals are journalled and visible across processes, and the budget is genuinely shared (15/15 across four processes) |
+| The Risk Gate blocks every adversarial proposal in its test set | **Verified for a much better test set** | the seven Task 5 cases still reject or shrink; a severity-5 objection now blocks; no action is a pass-through; a stale snapshot rejects. Residuals: the Ontario cap fails open on an unnamed coin (B6), and `exit`'s new bound is inert (B13) |
+
+I would sign off the foundation, the data layer and the ledger. I would **not** sign off the checkpoint
+as written, because the one control the checkpoint is really about — the kill switch — still cannot be
+trusted to have done what it reports.
+
+**The blocker's own verdict, since a safety control that reports success and does nothing was the
+worst thing found in round 1.** F13 is **substantially improved and NOT genuinely closed**:
+
+- Improved, and I verified each part myself: `KillSwitch` is now constructed on the hourly path and its
+  state survives a process restart; `halt_state()` reaches every `PortfolioContext`, so a halt blocks
+  new entries (`kill_switch_flat`, three live cycles); and the close plan goes through the same order
+  manager and the same transport as every other exit, carrying the venue's own resolved trade id
+  (`forceexit(tradeid=3, ordertype='market')` against the live venue, write intercepted). That is a
+  real change and it is the reason F13's other half now works.
+- Not closed, for two independent reasons. **(1)** The close list is read through a getter that returns
+  `[]` on any exception, so a `/flat` during a venue read failure submits nothing and reports
+  `closes: 0, errors: 0, venue_error: null, degraded: false`, exit 0 — reproducing round 1's exact
+  failure mode, and the failing condition is the *observed* behaviour of this venue (one successful
+  `status()` in six attempts). **(2)** There is still no production trigger: nothing in `agentoquant/`
+  calls `trigger_flat` (only a test and the acceptance script do), and nothing calls
+  `KillSwitch.evaluate`, so neither `/flat` nor the daily halt can be raised by the running system at
+  all. A control that a human cannot reach is not yet a control.
+
+**The single most dangerous thing that remains** is B1: the `/flat` close path fails open on a venue
+read error. It is the most dangerous because it is the same failure round 1 called the worst available
+— it reports success and leaves every position open — it is reachable today (the halt state is
+consumed and the venue answers the position read roughly one time in six), and the operator's next
+action is predicated on it having worked. B2 is the second half of the same problem and should be fixed
+in the same change: wire an actual trigger, and make an unconfirmed flat stay latched and loud.
+
+Runner-up, and the reason the "cost per cycle" clause still cannot be signed: F1's write-back is fixed
+in code but has never been exercised by a live fill, so every execution cost row in the soak is still
+`null`; and when a fill does land, the fee the ledger writes for a market order is twice the fee the
+venue charges (B9), so the first live number will be wrong in a way that looks authoritative.
+
+## What I could not verify, and why
+
+- **A live fill through the fixed write-back.** The venue holds one open ETH/USD position and the
+  placeholder's coin rotation did not target it during my work; the venue did not fill anything I could
+  observe. F1 is therefore "fixed in code, unproven in the soak", and I say so rather than calling it
+  closed.
+- **A `/flat` against the live venue end to end without intercepting the write.** Closing the soak's
+  only open position would have interfered with the soak, so I proved the call binding and the trade-id
+  resolution with the write intercepted and the reads live, and proved the loop's behaviour with a
+  transport that fails the way the live one fails.
+- **The venue's answer to a genuine concurrent writer.** B3's `Conflicting lock is held` is reproduced
+  between three independent processes; I did not reproduce it between the two actual production units,
+  because the early-signal runner is not installed as a service.
+- **Whether the reused-verdict dedupe can mis-collapse in production.** B12 is a stated residual with a
+  reproduced mechanism; I did not find a live case of two conflicting verdicts under one card id.
+- **The soak's remaining days.** What I reviewed is 11 genuine timer ticks (22 log lines, 12 cards, 9
+  execution rows); the three-day soak the status doc says the checkpoint needs has not yet accrued.
+
 ---
+
+## Ranked summary — round-2 findings
+
+| # | Finding | Severity |
+|---|---|---|
+| B1 | A `/flat` whose venue read times out closes nothing and reports a clean cycle | **blocker** |
+| B2 | Nothing in production can raise a halt: no `/flat` trigger, no automatic halt driver | **high** |
+| B3 | Two processes cannot open the ledger at the same instant (`Conflicting lock is held`, uncaught) | **high** |
+| B4 | A total venue failure no longer marks the cycle degraded (`errors: 3, degraded: False`, exit 0) | **high** |
+| B5 | Strategy-level refusals never reach the cycle summary | medium |
+| B6 | The Ontario cap fails open on a coin the non-empty context mapping does not name | medium |
+| B7 | The staleness rule rejects an unknown age under a declared limit, and the loop's own age is always zero | medium |
+| B8 | Outcomes are measured from the ledger's write clock, so a replay cannot produce a historical series | medium |
+| B9 | The ledger's two-rate fee does not match what the venue charges (2x on market orders) | medium |
+| B10 | An unfilled exit records the still-open trade's amount, rate and a fee | medium |
+| B11 | An exit resolves its target from the card's coin, not from the venue's open position | medium |
+| B12 | The verdict dedupe only collapses identical payloads (stated residual) | low |
+| B13 | `reduction_cap`'s shrink is unobservable for `exit` (the order is a full close) | low |
+| B14 | The soak's cycle log is the repo's default path, so dev and test runs pollute the evidence | low |
+| B15 | The quota journal is a second durable store, unbounded, invisible to `ledger query` | low |
+
+Everything in both tables was reproduced with a command whose output is quoted in its section. The
+items I could not reproduce are labelled as hypotheses in place (B6's exposure, B12's live case, and
+the notes above). Nothing in this report is copied from a fixer's test or from a fix report.
