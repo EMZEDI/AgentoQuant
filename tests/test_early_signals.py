@@ -180,7 +180,9 @@ class StubFetcher:
         self.closed = True
 
 
-def make_fetcher(transport: RecordingTransport | SequencedTransport, *, base_url: str = "", **kwargs: Any) -> HttpFetcher:
+def make_fetcher(
+    transport: RecordingTransport | SequencedTransport, *, base_url: str = "", **kwargs: Any
+) -> HttpFetcher:
     """An :class:`HttpFetcher` whose only client is the canned transport."""
     return HttpFetcher(
         base_url=base_url,
