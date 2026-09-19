@@ -575,7 +575,9 @@ The same emergency exit is charged **0.317243** in the ledger and **0.158621** b
 venue's simulated P&L is optimistic by 0.4% on every stop. Both numbers are wrong in opposite
 directions and nothing reconciles them. B9.
 
----## Part B — new findings against the fixes
+---
+
+## Part B — new findings against the fixes
 
 Severity is judged against the same bar as round 1: **blocker** stops the checkpoint, **high** means a
 claimed acceptance criterion is false or a safety invariant is unenforced, **medium** is a real
