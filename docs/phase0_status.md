@@ -11,11 +11,11 @@ where something could not be verified it says so instead of guessing.
 | 1 | Package skeleton, seven config files, enums, config loader, CLI (11 commands) and an MCP server exposing the same leaves | `uv lock --check` clean (138 packages); 41 tests; `agentoquant ingest` exit 3 with no traceback; MCP over stdio exposes 12 tools |
 | 2 | Fourteen-stage decision ledger in DuckDB, named queries, cost meter | 14 tables; `ledger query --query cycles` returns 4 cycles with 14/12/13/14 stages; field-name drift against addendum §4–6: 0 |
 | 3 | Quota manager, cache, seven connectors, hourly snapshot orchestrator | Live snapshot across every source; four positional-argument wiring bugs found and fixed with a regression test that drives the real registry |
-| 4 | Early-signal listeners (Bybit, OKX, Kraken, GitHub releases, Google News RSS, Telegram previews, on-chain webhooks) and a runner | Live 90 s run: 892 events, 0 failures, 0 restarts, every record carrying a `source_class` |
+| 4 | Early-signal listeners (Bybit, OKX, Kraken, GitHub releases, Google News RSS, Telegram previews, on-chain webhooks) and a runner | Live 90 s run: 892 events, 0 failures, 0 restarts, every record carrying a `source_class`; per-module suites now total 178 tests, and each of the three acceptance criteria is verified **by mutation** — revert the behaviour, watch the test fail |
 | 5 | Deterministic Risk Gate (23 rules), kill switch, funding floor | 18/18 acceptance checks against a real ledger; 27 adversarial tests, one case per rule |
 | 6 | Paper harness, freqtrade dry-run bridge, order manager for the twelve-action vocabulary, signal store, Telegram notifier, scheduler, systemd units | 24 consecutive cycles, 0 failures, three real dry-run trades each tagged with its cycle id |
 
-Gate on `main`: **235 tests pass, 1 skipped (opt-in live cost check), ruff clean.**
+Gate on `main`: **376 tests pass, 1 skipped (opt-in live cost check), ruff clean.**
 
 ## The loop is running unattended
 
