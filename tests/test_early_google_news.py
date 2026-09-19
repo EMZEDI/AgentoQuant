@@ -11,9 +11,10 @@ dedupe, failure accounting with backoff and recovery, the article-time helpers (
 from ``config/sleeves.yaml``, and close().
 
 Task 4's first verification step - "replay of three past listing days shows the signal ahead of the first
-article" - is measured here rather than asserted: ``test_a_listing_signal_is_measured_ahead_of_the_first_article``
-takes the first real article timestamp out of a Google News feed and checks that the ledger row's
-``latency_seconds_vs_first_article`` is positive.
+article" - is measured here rather than asserted:
+``test_a_listing_signal_is_measured_ahead_of_the_first_article`` takes the first real article timestamp
+out of a Google News feed and checks that the ledger row's ``latency_seconds_vs_first_article`` is
+positive.
 """
 
 from __future__ import annotations
@@ -283,9 +284,11 @@ def test_article_times_are_filtered_and_sorted_oldest_first() -> None:
     assert article_times(NEWS_FEED, after=FIRST_ARTICLE_AT) == [
         (FIRST_ARTICLE_AT, "Tread.fi Exchanges TREAD Markets - CryptoRank")
     ]
-    assert article_times(NEWS_FEED, before=FIRST_ARTICLE_AT) == [
+    assert article_times(NEWS_FEED, before=datetime(2026, 9, 16, 20, 0, tzinfo=UTC)) == [
         (ANNOUNCEMENT_AT, "Kraken lists TREAD - Kraken Blog")
     ]
+    # The window bounds are inclusive: an article at exactly the bound is kept.
+    assert len(article_times(NEWS_FEED, before=FIRST_ARTICLE_AT)) == 2
     assert article_times(NEWS_FEED, after=datetime(2026, 9, 17, tzinfo=UTC)) == []
     assert article_times(NEWS_FEED, before=datetime(2026, 1, 1, tzinfo=UTC)) == []
 
