@@ -253,8 +253,9 @@ def test_the_cap_uses_the_cad_conversion_the_context_carries(tmp_path) -> None:
         buy_card("SOL", size_pct=10.0, proposal_id="prop-sol-1-converted"),
         gate_context(now=now, coin="SOL", usd_cad_rate=1.37),
     )
-    assert converted.verdict == "shrunk", converted  # 30,825 CAD is over the cap
+    assert converted.verdict == "rejected", converted  # 30,825 CAD is at or over the cap
     assert converted.rule_fired == RULE_ONTARIO_NET_BUY_CAP
+    assert converted.final_size_pct == 0.0
 
 
 def test_exempt_coins_and_old_fills_do_not_count(tmp_path) -> None:
