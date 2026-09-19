@@ -556,6 +556,7 @@ def test_a_bad_signature_fails_closed_and_writes_nothing(tmp_path: Any, monkeypa
         "signature_present_but_invalid",
         "signature_missing",
         "signature_missing",
+        "signature_present_but_invalid",  # the Helius header on the Alchemy endpoint
     ]
     # The secret and the presented value are never logged.
     logged = json.dumps(writer.log.tail(limit=100))
