@@ -46,6 +46,7 @@ from agentoquant.execution.signal_store import SignalStore
 from agentoquant.execution.telegram_bot import TelegramNotifier
 from agentoquant.ledger.store import LedgerStore
 from agentoquant.risk import MarketContext, PortfolioContext, PositionContext, RiskGate
+from agentoquant.risk.kill_switch import HaltState, KillSwitch, build_kill_switch
 
 #: Where the loop writes its own log, one JSON object per line.
 LOG_SUBDIR = "paper"
@@ -115,12 +116,17 @@ def placeholder_context(
     card_record_id: str | None,
     book_value_cad: float,
     now: datetime | None = None,
+    halts: HaltState | None = None,
 ) -> PortfolioContext:
     """The Phase 0 context the Risk Gate evaluates against.
 
     Labelled placeholder data, not a market snapshot: it exists so the gate has something to evaluate
     while Task 3's ingest is unmerged. The card's own coin gets a tradable market with a fixed volume
     and spread, and a reduction action gets the open position it is reducing.
+
+    ``halts`` is the kill switch's state. It used to be omitted, which left every cycle evaluated
+    against ``HaltState(flat=False, daily_halted=False, weekly_halted=False)`` and made a ``/flat``
+    invisible to the Risk Gate.
     """
     coin = (card.coin or "").upper()
     markets = {
@@ -157,6 +163,7 @@ def placeholder_context(
         order_purpose="entry",
         stop_on_exchange=True,
         stop_price=round(price * (1 - PLACEHOLDER_STOP_PCT / 100.0), 8) if price else None,
+        halts=halts if halts is not None else HaltState(),
         now=now,
     )
 
@@ -190,6 +197,7 @@ def run_cycle(
     placeholder: bool = True,
     manager: OrderManager | None = None,
     notifier: TelegramNotifier | None = None,
+    kill_switch: KillSwitch | None = None,
     price: float | None = None,
     now: datetime | None = None,
     ack_wait_s: float = DEFAULT_ACK_WAIT_S,
@@ -220,8 +228,14 @@ def run_cycle(
     fee_tiers = load_fee_tiers()
     book_value_cad = float(load_settings().capital.starting_capital)
     reference_price = price if price is not None else placeholder_price(card.coin)
+    switches = kill_switch or build_kill_switch(limits, ledger=ledger)
     context = placeholder_context(
-        card, price=reference_price, card_record_id=card_id, book_value_cad=book_value_cad, now=moment
+        card,
+        price=reference_price,
+        card_record_id=card_id,
+        book_value_cad=book_value_cad,
+        now=moment,
+        halts=switches.halt_state(),
     )
     verdict = RiskGate(limits, ledger=ledger).evaluate(card, context)
     verdict_id = ledger.write(
@@ -267,6 +281,27 @@ def run_cycle(
             venue_error = f"{type(exc).__name__}: {exc}"
             venue_available = False
 
+    # 4b. a halt closes what is open. The kill switch places nothing itself: it returns the plans, and
+    # they go through the same order manager and the same dry-run transport as every other exit.
+    halt_state = switches.halt_state()
+    closes: list[Any] = []
+    if halt_state.entries_blocked:
+        targets: list[Any] = orders.open_positions() or [
+            {"coin": coin} for coin in switches.status().positions_to_close
+        ]
+        closes = switches.close_all_orders(targets, reason=", ".join(halt_state.reasons) or None)
+    if closes and venue_available:
+        try:
+            reports.extend(
+                orders.execute(
+                    orders.plan_closes(closes, cycle_id=cycle_id, price=reference_price or None),
+                    cycle_id=cycle_id,
+                    card_id=card_id,
+                )
+            )
+        except Exception as exc:
+            venue_error = f"{type(exc).__name__}: {exc}"
+
     # 5. the bridge's ack, if it has answered yet
     ack = _await_ack(store, cycle_id, ack_wait_s)
 
@@ -290,6 +325,8 @@ def run_cycle(
         "fee_tier": fee_tiers.current_tier,
         "cost_usd": cycle_cost_usd(ledger, cycle_id),
         "ack": "acked" if ack else "pending",
+        "halts": switches.halt_state().as_dict(),
+        "closes": len(closes),
         "venue_available": venue_available,
         "venue_error": venue_error,
         "degraded": not venue_available and bool(plan.intents),
@@ -358,6 +395,7 @@ def run_loop(
     store: SignalStore | None = None,
     transport: OrderTransport | None = None,
     notifier: TelegramNotifier | None = None,
+    kill_switch: KillSwitch | None = None,
     now: datetime | None = None,
     ack_wait_s: float = DEFAULT_ACK_WAIT_S,
     log_path: Path | None = None,
@@ -367,6 +405,9 @@ def run_loop(
     A cycle that fails is recorded and the loop continues; the run is reported as ``error`` only when
     every cycle failed. ``sleep`` waits one cadence between cycles, which is what makes a multi-hour
     invocation a real soak rather than a burst.
+
+    The kill switch is built **once per run** and handed to every cycle, so a halt raised on this tick
+    is honoured by the next cycle in the same process and, through its state file, by the next tick.
     """
     from agentoquant import scheduler
 
@@ -376,6 +417,7 @@ def run_loop(
     store = store or SignalStore()
     transport = transport if transport is not None else freqtrade_dry_run_transport()
     notifier = notifier if notifier is not None else TelegramNotifier()
+    switches = kill_switch or build_kill_switch(ledger=ledger)
     moment = now or datetime.now(UTC)
     gap = float(interval_s) if interval_s is not None else float(scheduler.cadence_minutes() * 60)
 
@@ -394,6 +436,7 @@ def run_loop(
                     sequence=base_sequence + index,
                     placeholder=placeholder,
                     notifier=notifier,
+                    kill_switch=switches,
                     now=moment,
                     ack_wait_s=ack_wait_s,
                     log_path=log_path,

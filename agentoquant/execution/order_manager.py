@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import inspect
 import os
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -370,6 +370,12 @@ class NullTransport:
     def supports(self, intent: OrderIntent) -> bool:
         return False
 
+    def open_positions(self) -> list[dict[str, Any]]:
+        return []
+
+    def last_price(self, pair: str) -> float | None:
+        return None
+
     def submit(self, intent: OrderIntent) -> dict[str, Any]:
         raise RuntimeError(f"no dry-run venue available: {self.reason}")
 
@@ -487,16 +493,61 @@ class _FreqtradeDryRunTransport:
         """
         if not pair:
             return None
-        try:
-            trades = self._client.status()
-        except Exception:
-            return None
-        for row in trades or []:
-            if not isinstance(row, dict):
-                continue
+        for row in self._open_trades():
             if row.get("pair") == pair and row.get("is_open", True):
                 return row.get("trade_id")
         return None
+
+    def _open_trades(self) -> list[dict[str, Any]]:
+        """The venue's open trades, or an empty list when the API does not answer."""
+        try:
+            trades = self._client.status()
+        except Exception:
+            return []
+        return [row for row in trades or [] if isinstance(row, dict)]
+
+    def open_positions(self) -> list[dict[str, Any]]:
+        """The venue's open positions in the shape the kill switch closes them in."""
+        positions: list[dict[str, Any]] = []
+        for row in self._open_trades():
+            pair = row.get("pair")
+            if not pair:
+                continue
+            positions.append(
+                {
+                    "coin": str(pair).split("/")[0],
+                    "pair": pair,
+                    "amount": row.get("amount"),
+                    "stake_amount": row.get("stake_amount"),
+                    "trade_id": row.get("trade_id"),
+                    "is_open": row.get("is_open", True),
+                }
+            )
+        return positions
+
+    def last_price(self, pair: str, *, timeframe: str = "5m") -> float | None:
+        """The venue's own last close for ``pair``, or ``None`` when the API does not answer.
+
+        This is the price the venue itself would trade against, which is what a post-only entry has
+        to be anchored to: a limit far below a stale reference price can never fill.
+        """
+        try:
+            payload = self._client.pair_candles(pair, timeframe, limit=1)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        data = payload.get("data")
+        if not data:
+            return None
+        row = data[-1]
+        columns = payload.get("columns") or []
+        try:
+            if "close" in columns:
+                return float(row[columns.index("close")])
+            return float(row[4]) if len(row) > 4 else None
+        except (TypeError, ValueError, IndexError):
+            return None
 
     def submit(self, intent: OrderIntent) -> dict[str, Any]:
         call = intent.freqtrade_call.split("+")[0]
@@ -731,6 +782,86 @@ class OrderManager:
             decision_card_id=card_id,
             detail=detail,
         )
+
+    def plan_closes(
+        self,
+        closes: Iterable[Any],
+        *,
+        cycle_id: str,
+        price: float | None = None,
+        emergency: bool = True,
+    ) -> ExecutionPlan:
+        """A kill-switch flatten: one full exit per position the halt must close.
+
+        ``CloseOrderPlan`` objects come from the kill switch, which places nothing itself. A halt is
+        an emergency exit, so the close is a taker order — the one purpose besides a stop that
+        ``market_orders_allowed_for`` permits.
+        """
+        intents: list[OrderIntent] = []
+        for close in closes:
+            coin = getattr(close, "coin", None) or str(close)
+            pair = pair_for(str(coin))
+            purpose = PURPOSE_EMERGENCY_EXIT if emergency else PURPOSE_EXIT
+            order_type = "market" if emergency else "post_only_limit"
+            assert_order_type_allowed(order_type, purpose, limits=self.execution_limits)
+            intents.append(
+                OrderIntent(
+                    action=Action.EXIT,
+                    path="full_exit",
+                    pair=pair,
+                    purpose=purpose,
+                    side="sell",
+                    order_type=order_type,
+                    freqtrade_call="forceexit",
+                    freqtrade_kwargs={
+                        "pair": pair,
+                        "ordertype": "market" if emergency else "limit",
+                        "price": None if emergency else price,
+                        "exit_tag": f"kill_switch:{cycle_id}",
+                    },
+                    price=None if emergency else price,
+                    post_only=not emergency,
+                    reprices_allowed=0,
+                    notes=f"kill switch: close {coin} ({getattr(close, 'reason', 'halt')})",
+                )
+            )
+        return ExecutionPlan(
+            cycle_id=cycle_id,
+            action=Action.EXIT,
+            path="full_exit",
+            approved=True,
+            intents=tuple(intents),
+            detail=f"kill switch: {len(intents)} position(s) to close",
+        )
+
+    def open_positions(self) -> list[dict[str, Any]]:
+        """The venue's open positions, when the transport can report them.
+
+        The kill switch closes what is actually open, so the positions come from the venue rather
+        than from the card: a ``/flat`` on a tick whose card is a HOLD still has to close everything.
+        """
+        getter = getattr(self.transport, "open_positions", None)
+        if not callable(getter):
+            return []
+        try:
+            positions = getter()
+        except Exception:
+            return []
+        return [dict(row) for row in positions or [] if isinstance(row, Mapping)]
+
+    def venue_price(self, pair: str | None) -> float | None:
+        """The venue's own last price for ``pair``, or ``None`` when the transport cannot say."""
+        getter = getattr(self.transport, "last_price", None)
+        if not callable(getter) or not pair:
+            return None
+        try:
+            price = getter(pair)
+        except Exception:
+            return None
+        try:
+            return float(price) if price is not None else None
+        except (TypeError, ValueError):
+            return None
 
     def _build(
         self, action: Action, path: str, request: _PlanRequest

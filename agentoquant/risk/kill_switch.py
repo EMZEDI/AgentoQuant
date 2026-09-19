@@ -24,12 +24,15 @@ to freeze them.
 
 from __future__ import annotations
 
+import json
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from agentoquant.config_loader import RiskLimits, load_settings
+from agentoquant.config_loader import RiskLimits, load_risk_limits, load_settings, repo_root
 from agentoquant.enums import Sleeve, Stage
 from agentoquant.ledger.schema import HumanActionPayload
 from agentoquant.ledger.store import LedgerStore
@@ -52,6 +55,20 @@ VENUE_WRITES_ENABLED = False
 
 #: The order type a halt uses to close a position: a stop-out must not wait for a maker fill.
 CLOSE_ORDER_TYPE = "market"
+
+#: Where the halt state survives between the hourly ticks. The paper loop is a **fresh process** every
+#: hour, so a ``/flat`` that lived only in memory would be forgotten by the next tick: the panic
+#: button would report success and leave every position open on the tick after it.
+STATE_PATH_ENV = "AGENTOQUANT_KILL_SWITCH_STATE"
+STATE_FILENAME = "kill_switch.json"
+
+
+def default_state_path() -> Path:
+    """``AGENTOQUANT_KILL_SWITCH_STATE`` if set, else ``<repo root>/data/kill_switch.json``."""
+    override = os.environ.get(STATE_PATH_ENV)
+    if override:
+        return Path(override)
+    return repo_root() / "data" / STATE_FILENAME
 
 
 @dataclass(frozen=True)
@@ -169,6 +186,8 @@ class KillSwitch:
         ledger: LedgerStore | None = None,
         *,
         now: Callable[[], datetime] | None = None,
+        state_path: Path | str | None = None,
+        persist: bool = True,
     ) -> None:
         self.limits = limits
         self.ledger = ledger
@@ -179,6 +198,71 @@ class KillSwitch:
         self._pending_closes: tuple[str, ...] = ()
         self._last_reason: str | None = None
         self._resumed_by_human = False
+        self.state_path: Path = Path(state_path) if state_path is not None else default_state_path()
+        self.persist = bool(persist)
+        self.restore()
+
+    # -- persistence ---------------------------------------------------------------------------
+
+    def as_state(self) -> dict[str, object]:
+        """The halt state as plain JSON, for the next tick to pick up."""
+        return {
+            "flat_at": self._flat_at.isoformat() if self._flat_at else None,
+            "daily_halt_at": self._daily_halt_at.isoformat() if self._daily_halt_at else None,
+            "weekly_halt_at": self._weekly_halt_at.isoformat() if self._weekly_halt_at else None,
+            "pending_closes": list(self._pending_closes),
+            "last_reason": self._last_reason,
+            "resumed_by_human": self._resumed_by_human,
+        }
+
+    def restore(self) -> HaltState:
+        """Load the persisted state. A missing or unreadable file means "nothing is halted"."""
+        if not self.persist:
+            return self.halt_state()
+        try:
+            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return self.halt_state()
+        if not isinstance(payload, dict):
+            return self.halt_state()
+
+        def moment(key: str) -> datetime | None:
+            value = payload.get(key)
+            if not isinstance(value, str):
+                return None
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+        self._flat_at = moment("flat_at")
+        self._daily_halt_at = moment("daily_halt_at")
+        self._weekly_halt_at = moment("weekly_halt_at")
+        closes = payload.get("pending_closes")
+        self._pending_closes = tuple(str(c) for c in closes) if isinstance(closes, list) else ()
+        reason = payload.get("last_reason")
+        self._last_reason = str(reason) if reason else None
+        self._resumed_by_human = bool(payload.get("resumed_by_human"))
+        return self.halt_state()
+
+    def save(self) -> None:
+        """Write the state atomically, so a reader never sees half a document."""
+        if not self.persist:
+            return
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.state_path.parent / f".{self.state_path.name}.tmp-{os.getpid()}"
+        try:
+            with open(temp, "w", encoding="utf-8") as handle:
+                json.dump(self.as_state(), handle, sort_keys=True, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, self.state_path)
+        except OSError:  # pragma: no cover - an unwritable state dir must not crash the loop
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     # -- clock and state -----------------------------------------------------------------------
 
@@ -239,6 +323,7 @@ class KillSwitch:
         self._resumed_by_human = False
         self._pending_closes = self._coins(positions)
         self._record_human_action(COMMAND_FLAT, actor, cycle_id)
+        self.save()
         return self.status()
 
     def trigger_daily_halt(
@@ -255,6 +340,7 @@ class KillSwitch:
         self._last_reason = reason
         self._pending_closes = self._coins(positions)
         self._record_human_action(COMMAND_PAUSE, actor, cycle_id)
+        self.save()
         return self.status()
 
     def trigger_weekly_halt(
@@ -271,6 +357,7 @@ class KillSwitch:
         self._last_reason = reason
         self._pending_closes = self._coins(positions)
         self._record_human_action(COMMAND_PAUSE, actor, cycle_id)
+        self.save()
         return self.status()
 
     def resume(
@@ -294,6 +381,7 @@ class KillSwitch:
         self._pending_closes = ()
         self._resumed_by_human = bool(human and cleared_weekly)
         self._record_human_action(COMMAND_RESUME, actor, cycle_id)
+        self.save()
         return self.status()
 
     # -- automatic triggers --------------------------------------------------------------------
@@ -408,6 +496,30 @@ class KillSwitch:
         )
 
 
+def build_kill_switch(
+    limits: RiskLimits | None = None,
+    ledger: LedgerStore | None = None,
+    *,
+    now: Callable[[], datetime] | None = None,
+    state_path: Path | str | None = None,
+    persist: bool = True,
+) -> KillSwitch:
+    """The kill switch the production paths use: persisted, so the next tick still knows.
+
+    Nothing in ``agentoquant`` used to construct one, which is how a ``/flat`` could report success
+    and leave every position open. The hourly loop builds it here, so the halt state it restores is
+    the one a human set on a previous tick.
+    """
+    resolved = limits if limits is not None else load_risk_limits()
+    return KillSwitch(
+        resolved,
+        ledger=ledger,
+        now=now,
+        state_path=state_path,
+        persist=persist,
+    )
+
+
 __all__ = [
     "CLOSE_ORDER_TYPE",
     "COMMAND_FLAT",
@@ -421,6 +533,10 @@ __all__ = [
     "KillSwitch",
     "KillSwitchStatus",
     "RISK_GATE_ROLE",
+    "STATE_FILENAME",
+    "STATE_PATH_ENV",
     "VENUE_WRITES_ENABLED",
+    "build_kill_switch",
+    "default_state_path",
     "next_reset",
 ]
