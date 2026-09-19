@@ -634,3 +634,262 @@ phase report's "22 rules" is wrong: the module exposes 23.
 **Suggested fix.** Delete `sleeve_caps_pct` and `min_concurrent` from `risk_limits.yaml` (or make the
 gate read them and remove the duplicate from `sleeves.yaml` — one source, named once). Correct
 `docs/phase0_status.md` to 23 rules, or state which rule is excluded from the count.
+
+---
+
+## F13 — the kill switch is not on any production path, and `/flat` closes nothing
+
+**Severity: blocker** (Task 5's acceptance criterion "Kill switch (/flat and daily halt) closes
+positions and blocks new entries" is false, and this is the one control whose failure mode is
+"reports success and does nothing")
+
+**Files/lines**
+- `agentoquant/risk/kill_switch.py:332-353` — `close_all_orders` returns `CloseOrderPlan` values.
+- `agentoquant/risk/kill_switch.py:228-242` — `trigger_flat` sets `_flat_at`, records
+  `_pending_closes`, writes a `human_action` row.
+- `agentoquant/risk/kill_switch.py:340-343` — "The module has no exchange client ... so a halt can
+  close a paper book and nothing else."
+- `agentoquant/execution/paper.py:147-161` — `placeholder_context` builds a `PortfolioContext` with
+  no `halts` argument, so the gate always sees the default `HaltState()`.
+
+**What I did.** Searched every consumer of the close plans and every production construction of a
+`KillSwitch`, then checked what the hourly loop passes to the gate.
+
+**What I observed.**
+
+```
+$ grep -rn "close_all_orders\|positions_to_close\|CloseOrderPlan\|pending_closes" --include=*.py . | grep -v '.venv'
+./agentoquant/risk/kill_switch.py:92:class CloseOrderPlan:
+./agentoquant/risk/kill_switch.py:332:    def close_all_orders(
+./agentoquant/risk/kill_switch.py:416:    "CloseOrderPlan",
+./scripts/task5_acceptance.py:162:    tuple(plan.positions_to_close) == ("BTC", "TAO") and plan.entries_blocked,
+./scripts/task5_acceptance.py:196:    and tuple(daily.positions_to_close) == ("BTC", "TAO"),
+```
+```
+$ grep -rn "KillSwitch(" --include=*.py agentoquant/ tests/ scripts/
+scripts/task5_acceptance.py:41:ks = KillSwitch(limits, ledger=ledger, now=lambda: NOW)
+```
+
+`close_all_orders` has no caller outside its own definition. `KillSwitch` is constructed only in
+`scripts/task5_acceptance.py`. Neither `agentoquant/cli.py`, `agentoquant/mcp_server.py`,
+`agentoquant/execution/paper.py` nor `agentoquant/scheduler.py` mentions it. And the loop never passes
+`halts=` to `PortfolioContext`, so `gate.py:457-463` always evaluates against
+`HaltState(flat=False, daily_halted=False, weekly_halted=False)`.
+
+**Why it matters.** `tasks/todo.md`'s Task 5 acceptance criterion is "Kill switch (`/flat` and daily
+halt) closes positions and blocks new entries". Both halves fail in the running system:
+
+- **Closes positions:** false. `close_all_orders` produces plan objects and returns them; nothing
+  submits them. A `/flat` would set the flag, write a `human_action` ledger row with
+  `within_window=True`, and report `positions_to_close: [...]` in `status()` — all of which reads as
+  success while every position stays open. The docstring at `kill_switch.py:340-343` is honest that
+  it never places anything, but the acceptance criterion is not qualified that way, and
+  `docs/phase0_status.md:15` claims "18/18 acceptance checks" for this task.
+- **Blocks new entries:** only if a `HaltState` reaches the gate. Nothing in the loop supplies one,
+  so in the soak the halt half is also inert.
+
+**Suggested fix.** Wire it: have the loop (and the Telegram `/flat` handler) construct a `KillSwitch`
+with the persisted halt state, pass `halts=kill_switch.halt_state` into every `PortfolioContext`, and
+consume `close_all_orders(...)` in the order manager as `Action.EXIT` intents so a flat actually
+produces force exits. Add an end-to-end test that triggers `/flat` and asserts an exit intent reached
+the transport, not that a plan object was returned.
+
+---
+
+## F14 — the early-signal layer bypasses the repo-wide quota manager entirely
+
+**Severity: medium** (the checkpoint clause "no API quota breaches" is verified for the ingest path
+only; seven sources' declared quotas are not enforced by the manager that reports breaches)
+
+**Files/lines**
+- `agentoquant/data/early_signals/__init__.py:189` — the section comment: "no shared quota manager:
+  Task 3 owns that, Task 6 wires".
+- `agentoquant/data/early_signals/__init__.py:197-227` — the local `RateLimiter`.
+- `agentoquant/data/early_signals/bybit_listings.py:137`, `okx_listings.py:133`,
+  `kraken_listings.py:247,252`, `github_releases.py:138`, `google_news_rss.py:224`,
+  `telegram_previews.py:205` — each listener builds its own limiter.
+- `agentoquant/data/ingest.py:614` — `quota_breaches=quota.breaches()`, the report the checkpoint
+  leans on.
+
+**What I did.** Searched the early-signal package for any use of `QuotaManager`, and compared each
+listener's local limiter against the quota declared for it in `config/sources.yaml`.
+
+**What I observed.**
+
+```
+$ grep -rn "QuotaManager\|quota" agentoquant/data/early_signals/*.py
+agentoquant/data/early_signals/bybit_listings.py:115:    """Fast poll of Bybit's announcement index, 20 s by default (quota allows one call per 6 s)."""
+agentoquant/data/early_signals/google_news_rss.py:200:    """Polls one Google News query per ticker every 5 minutes (quota allows 6 calls/minute)."""
+agentoquant/data/early_signals/__init__.py:189:# HTTP: rate limiting and backoff, httpx only (no shared quota manager: Task 3 owns that, Task 6 wires)
+agentoquant/data/early_signals/__init__.py:200:    Deliberately tiny and local: Task 3 owns the repo-wide quota manager and Task 6 wires these
+```
+
+No listener imports or constructs `QuotaManager`. Each builds `RateLimiter(60.0 / CALLS_PER_MINUTE)`
+with a hard-coded constant, so:
+
+- `quota.breaches()` (`ingest.py:614`) is structurally zero for those seven sources: they never call
+  `acquire`, so they can never be refused and can never be counted. The "no API quota breaches"
+  evidence is silent about them rather than supportive.
+- The rolling `calls_per_hour` / `calls_per_day` / `monthly_credits` ceilings cannot be expressed by a
+  minimum-interval limiter at all, and the per-source `cache_ttl_seconds` (Bybit 30 s, OKX 30 s,
+  GitHub 900 s, Google News 600 s) is not used, because there is no TTL cache in this path.
+
+**Why it matters.** `agentoquant/data/quota_manager.py:7` claims "A quota breach is therefore
+impossible by construction". That is true of the ingest path and false of the early-signal path, which
+is the one that runs continuously (`data/early_signals/runner.py`) rather than once an hour. Task 6
+was the task that was supposed to wire them and did not.
+
+**Suggested fix.** Give `HttpFetcher` an optional `QuotaManager` and route every listener fetch
+through `Transport` (or at least `quota.acquire`) using the source name from `sources.yaml`, so the
+declared ceilings and the breach counter cover every source. Until then, report the early-signal
+sources as "quota: not enforced" in the ingest report rather than omitting them.
+
+---
+
+## F15 — quota accounting is per process, so a budget can be spent twice
+
+**Severity: medium** (a claim of structural impossibility that a second process defeats)
+
+**Files/lines**
+- `agentoquant/data/quota_manager.py:193-195` — `_load` memoizes the journal in `self._entries`.
+- `agentoquant/data/quota_manager.py:226-227` — `_append` mutates that memoized list.
+- `agentoquant/data/quota_manager.py:7-8` — "A quota breach is therefore impossible by construction".
+
+**What I did.** Two `QuotaManager` instances over one journal file, the first loading its view before
+the second spends the budget.
+
+**What I observed.**
+
+```
+B loads its view first -> 10
+A remaining: 0
+B remaining AFTER A spent the whole budget: 10
+B acquired anyway: the budget was spent twice across two processes
+journal lines on disk: 11
+```
+
+**Why it matters.** The journal is the durable record, but each instance reads it once and never
+re-reads, so any second process or long-lived instance has its own copy of the budget. The hourly loop
+is a fresh `oneshot` systemd process each tick while the early-signal runner is a long-lived process,
+so the two would not see each other's spend even if F14 were fixed. "Impossible by construction" is
+too strong.
+
+**Suggested fix.** Re-read the journal tail (or at least stat its mtime and size) before each `check`
+when the file has changed, or move the budget into the DuckDB ledger with an atomic
+`INSERT ... SELECT WHERE count < ceiling`. Add a test with two instances and an interleaved spend.
+
+---
+
+## F16 — tests that cannot fail
+
+**Severity: medium** (two acceptance criteria are asserted by tests that are true by construction, and
+the ledger's completeness test is blind to F3)
+
+**Files/lines**
+- `tests/test_cli_mcp_parity.py:64-65` — `assert registered_tool_names() == cli.mcp_tool_names()`.
+- `agentoquant/mcp_server.py:24-26` — `registered_tool_names()` is `return cli.mcp_tool_names()`.
+- `tests/test_ledger_roundtrip.py:588-595` — `test_every_stage_has_records_in_the_synthetic_day`.
+- `tests/test_ledger_roundtrip.py:598-606` — `test_every_record_is_linked_to_a_cycle`.
+
+**What I did.** Read both tests and the functions they call, then traced what writes the records they
+count.
+
+**What I observed.** The parity assertion compares a function to itself:
+
+```
+agentoquant/mcp_server.py:24:def registered_tool_names() -> list[str]:
+agentoquant/mcp_server.py-25-    """Tool names this server exposes, in the CLI's order."""
+agentoquant/mcp_server.py-26-    return cli.mcp_tool_names()
+```
+
+so `test_mcp_tool_listing_matches_the_cli_registry` is a tautology. The real cross-check,
+`test_every_plan_command_exists_as_a_leaf_command` (line 73-88), compares `cli.cli_command_names()`
+against a hard-coded set — never against the MCP list. The MCP names are spelled with underscores
+(`propose_skill`, `ledger_query`, `worldview_get`, `worldview_flag`, `fund_request`) while the plan's
+fixed list spells them `propose-skill`, `ledger query`, `worldview get`, `worldview flag`,
+`fund request`, and nothing asserts that mapping. The second parity test (line 68-70) does open a real
+stdio MCP session and is genuine, so the *count* is proven and the *spelling* is not.
+
+The ledger test is the more consequential one. It asserts every one of the fourteen stages has records
+in a "synthetic day" fixture that the test file itself writes, and pins `counts["outcome"] == 12`.
+Production code writes no outcome rows at all (F3), so this test proves the *table and the store
+helper* work while the criterion it appears to satisfy — every stage written for every cycle — is
+false of the loop. It cannot fail for the defect it is named for.
+
+**Why it matters.** The checkpoint clause "every cycle and every token in the ledger" is the one this
+suite is supposed to underwrite, and the suite is structured so that it cannot detect the missing
+stage. The same pattern is what let F2's double write survive a passing suite.
+
+**Suggested fix.** Make `registered_tool_names()` query the real server (it already can, over stdio)
+instead of delegating to the CLI helper, and assert the plan's literal spellings somewhere. Replace
+the synthetic-day completeness test with one that runs `paper.run_cycle` against a scratch ledger and
+then asserts which stages exist — the outcome stage would be missing, which is the correct result
+today and the regression guard after the fix.
+
+---
+
+## F17 — spec literalism: what matches, and the small deviations
+
+**Severity: low**
+
+**What I did.** Diffed `tasks/schema_scaffold_addendum.md` §1, §3 and §4-6 against the tree and the
+code, mechanically where possible.
+
+**What I observed.**
+
+```
+Action           match=True got=OK
+Sleeve           match=True got=OK
+ConfidenceBand   match=True got=OK
+SourceClass      match=True got=OK
+ModelFamily      match=True got=OK
+Harness          match=True got=OK
+Stage            match=True got=OK
+extra public names: ['REJECTED_ACTIONS']
+```
+```
+CLI commands: 11 ['backtest', 'decide', 'forecast', 'fund', 'ingest', 'ledger', 'paper',
+ 'propose-skill', 'retrain', 'review', 'worldview']
+```
+```
+227 passed, 1 skipped in 76.18s (0:01:16)
+```
+
+Matches, verified rather than assumed:
+
+- **All seven canonical enums match §3 value for value**, with one addition (`REJECTED_ACTIONS`, the
+  banned vocabulary §3 names in a comment — a reasonable place for it).
+- **The file tree is complete for Phase 0's scope.** Every file §1 lists for Tasks 1-6 exists at the
+  exact path: all seven `config/*.yaml`, `ledger/{schema,store,cost_meter}.py`, all nine
+  `data/connectors/*`, all seven `data/early_signals/*`, `quota_manager.py`, `cache.py`,
+  `risk/{gate,kill_switch,funding_floor}.py`, `execution/{signal_store,freqtrade_strategy,order_manager,telegram_bot}.py`,
+  `scheduler.py`, `freqtrade_user_data/{config.json,strategies/AgentBridgeStrategy.py}`,
+  `tests/{test_risk_gate_adversarial,test_ledger_roundtrip}.py`. The absent files
+  (`market_store.py`, `test_leakage.py`, `test_schema_validation.py`, `scripts/backfill_kraken_history.py`,
+  `features/`, `labels/`, `models/`, `verifier/`) are all owned by later tasks.
+- **The stage payload models in `ledger/schema.py:164-304` are field-for-field the addendum's §4
+  shapes**, including `Optional[...]` placement, the `Stage`-per-table mapping and the §5/§6
+  `MarketBrief`/`DecisionCard` shapes. I found no renamed, added or dropped field.
+- **The ledger really does create fourteen tables** (`tests/test_ledger_roundtrip.py:479`,
+  `len(tables) == 14`), and the soak ledger shows all fourteen present.
+- **The test gate is green**: `227 passed, 1 skipped in 76.18s`.
+
+Deviations, in ascending order of significance:
+
+1. `docs/phase0_status.md:15` says "22 rules" where the module exposes 23 (F12), and line 18 says
+   "197 tests pass, 1 skipped" where the tree now runs 227. Both are report drift, not code drift.
+2. `agentoquant/data/early_signals/runner.py` and `agentoquant/execution/paper.py` are additions §1
+  does not list. Both are load-bearing (the soak's timer calls `paper`), and both were reported in
+   the task reports, so they read as the "smallest deviation, stated" that §0 permits rather than
+   silent invention.
+3. The MCP tool spellings diverge from the plan's fixed command names (F16), and nothing tests the
+   mapping.
+
+**Why it matters.** The addendum calls §1/§3/§4-6 literal and asks for deviations to be stated. For
+Phase 0's scope the code honours that to the letter on everything I could check mechanically, which is
+worth saying plainly: the spec-literal core of this phase is in good shape, and the defects are in
+behaviour (F1-F16), not in shape.
+
+**Suggested fix.** None for the tree or the enums. Fix the two stale numbers in
+`docs/phase0_status.md`, and decide the MCP naming question explicitly (either adopt the plan's
+hyphenated names or record the underscore mapping as a stated deviation in the addendum).
