@@ -441,3 +441,58 @@ def test_a_retry_spends_a_second_unit_of_the_budget(tmp_path: Path) -> None:
 
     assert transport.count == 3
     assert quota.used("bybit_announcements", 60) == 3
+
+
+# ----------------------------------------------------------------------------------------------
+# The snapshot's own honesty: an over-budget source is skipped, recorded, and the cycle completes
+# ----------------------------------------------------------------------------------------------
+
+
+def test_an_over_budget_connector_is_skipped_and_the_snapshot_reports_it(tmp_path: Path) -> None:
+    """The hourly snapshot degrades instead of failing, and says which source it skipped and why."""
+    from agentoquant.data import ConnectorResult, RetryPolicy, Transport
+    from agentoquant.data.cache import Cache
+    from agentoquant.data.ingest import run_snapshot
+
+    journal = tmp_path / "quota.jsonl"
+    quota = QuotaManager(journal_path=journal)
+    ceiling = int(quota.limits("gold_api")["calls_per_hour"])
+    for _ in range(ceiling):
+        quota.acquire("gold_api")
+    transport = Transport(quota=quota, cache=Cache(path=tmp_path / "cache"))
+
+    def kraken_runner(inner_transport: Transport, ctx: Any) -> list[ConnectorResult]:
+        return [
+            ConnectorResult(source="kraken_rest", coin_or_series=symbol, fields={"price": 1.0})
+            for symbol in ctx.symbols
+        ]
+
+    def gold_runner(inner_transport: Transport, _ctx: Any) -> list[ConnectorResult]:
+        response = inner_transport.request(
+            "GET",
+            "https://api.gold-api.com/price/XAU",
+            source="gold_api",
+            ttl_seconds=0,
+            retry=RetryPolicy(attempts=1),
+        )
+        return [
+            ConnectorResult(source="gold_api", coin_or_series="gold_spot_xau", fields=response.payload or {})
+        ]
+
+    report = run_snapshot(
+        cycle_id="2026-09-19T12Z-0001",
+        symbols=["BTC"],
+        ledger=LedgerStore(db_path=tmp_path / "ledger.duckdb"),
+        transport=transport,
+        runners={"kraken_rest": kraken_runner, "gold_api": gold_runner},
+        quota=quota,
+    )
+
+    assert report.cycle_id == "2026-09-19T12Z-0001"  # the cycle completed, it did not raise
+    assert report.missing_sources == ["gold_api"]
+    assert report.quota_breaches == {"gold_api": 1}
+    assert any(
+        "gold_api" in note and "calls_per_hour" in note for note in report.notes
+    ), f"the skipped source is not reported with its reason: {report.notes}"
+    assert any("shared with the early-signal listener runner" in note for note in report.notes)
+
