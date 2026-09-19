@@ -255,6 +255,13 @@ def test_executed_rejected_and_vetoed_cards_all_get_a_row(tmp_path) -> None:
     for card_id in (executed, rejected, vetoed):
         backdate(ledger, "decision_card", card_id, old)
 
+    due = ledger.due_outcomes("1h", as_of=now)
+    assert {row["decision_card_id"] for row in due} == {executed, rejected, vetoed}
+    verdicts = {row["decision_card_id"]: row["verdict"] for row in due}
+    commands = {row["decision_card_id"]: row["human_command"] for row in due}
+    assert verdicts == {executed: "approved", rejected: "rejected", vetoed: "approved"}
+    assert commands[vetoed] == "veto"
+
     result = record_due_outcomes(ledger, as_of=now)
     assert result["by_horizon"] == {"1h": 3, "4h": 0, "24h": 0}, result
     rows = {row["decision_card_id"]: row for row in outcome_rows(ledger)}
@@ -264,12 +271,6 @@ def test_executed_rejected_and_vetoed_cards_all_get_a_row(tmp_path) -> None:
     assert rows[vetoed]["still_open"] is False, "a vetoed card opened nothing"
     assert all(row["realized_up"] is None for row in rows.values())
     assert all(row["pnl_pct"] is None for row in rows.values())
-
-    due = ledger.due_outcomes("1h", as_of=now)
-    verdicts = {row["decision_card_id"]: row["verdict"] for row in due}
-    commands = {row["decision_card_id"]: row["human_command"] for row in due}
-    assert verdicts == {executed: "approved", rejected: "rejected", vetoed: "approved"}
-    assert commands[vetoed] == "veto"
 
 
 def test_a_null_fill_records_the_horizon_with_honest_nulls(tmp_path) -> None:
