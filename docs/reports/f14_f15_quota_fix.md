@@ -4,6 +4,9 @@ Task:        Fix the data-layer findings from `docs/reviews/phase0_adversary.md`
 Branch:      `fix/quota-adversary`      Worktree: `~/work/agentoquant-wt/fix-quota`
 Status:      complete (both findings fixed; see "Not done" for what is deliberately left to the phase agent)
 Baseline:    `main` = `4fedfc4`, 234 passed / 1 skipped
+Merged:      `main` at `c28129b` (Task 4's per-module listener tests, F16/F17, F18) merged in on this
+             branch: **396 passed, 1 skipped, ruff clean** on the merged tree, so this branch
+             integrates with the work that landed while it was open.
 
 ## Findings
 
@@ -174,6 +177,9 @@ FAILED test_an_over_budget_connector_is_skipped_and_the_snapshot_reports_it
 $ .venv/bin/python -m pytest -q
 249 passed, 1 skipped in 80.86s       <- 234 baseline + 15 new
 
+$ git merge main --no-edit ; .venv/bin/python -m pytest -q
+396 passed, 1 skipped in 87.15s       <- after merging main at c28129b (Task 4's per-module tests)
+
 $ .venv/bin/python -m ruff check .
 All checks passed!
 
@@ -227,10 +233,14 @@ same manager before they do.
    F14/F15, and out of this task's scope (another agent owns that area). It is worth verifying
    against the live soak before the 3-day checkpoint run; the smallest fix on the store side is a
    per-write connection in the runner rather than one held for the process's life.
-2. **`tests/test_early_signals.py`'s docstring advertises runner coverage it does not have.** The file
-   ends at line 650 with a sentinel and contains no `build_listeners`/`Runner` tests at all (they were
-   lost when a killed agent's test file was repaired). This belongs to the F16 test-hygiene work, not
-   to this fix; this change adds the wiring tests that were missing, which is a partial remedy.
+2. **The runner's coverage gap is closed on `main`, not here.** `tests/test_early_signals.py`'s
+   docstring advertises runner coverage it does not have (the file ends at line 650 with a sentinel),
+   but the per-module files `tests/test_early_runner.py` and friends landed on `main` while this
+   branch was open and this branch merged them cleanly. Worth knowing that
+   `test_build_listeners_returns_the_six_pollers_with_scaled_intervals` calls `build_listeners`
+   without a quota manager: the default `QuotaManager()` is constructed and never used, which writes
+   nothing (the journal is only touched by `acquire`), and the test never polls — verified: no
+   `data/quota_journal.jsonl` appears after a full-suite run.
 
 ## Not done (deliberately, and who owns it)
 
