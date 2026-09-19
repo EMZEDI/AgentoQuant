@@ -24,6 +24,33 @@ Gate on `main`: **197 tests pass, 1 skipped (opt-in live cost check), ruff clean
   loop still records cycles but submits nothing, so a soak would prove nothing about execution.
 - Both installed and enabled; first timer tick 06:00 UTC.
 
+Firing the timer's own unit (`systemctl --user start agentoquant-hourly.service`) proved the
+unattended path end to end: exit 0, cycle `2026-09-19T05Z-0001`, action `enter_laddered`, verdict
+`approved`, `orders: 1`, `ack: acked`, no failures. What the venue then did, read out of
+`freqtrade_user_data/agentoquant-paper.sqlite`:
+
+| Order | Type | Side | Status |
+|---|---|---|---|
+| 1 | limit @ 59,940.0 | buy | **canceled** — never filled (finding 1 below) |
+| 2, 4, 6 | limit @ 80,996.6 | buy | filled, three ladder slices of 0.00010555 BTC ($8.55 each) |
+| 3, 5 | market @ 76,946.8 | sell | canceled — stops replaced as the position grew |
+| 7 | market @ 76,946.8 | sell | **open, full position 0.00031665** — the stop resting on the exchange |
+
+Trade row: `stop_loss: 76946.8` (−5% from the 80,996.6 open rate), `is_open: 1`, `enter_tag` equal to
+the cycle id. So the checkpoint clause "post-only orders and stops on the exchange" is confirmed with
+a real artifact, and the stop ratchets as the position grows.
+
+## Two findings the unattended run made precise
+
+1. **The placeholder entry price is a fixed 60,000, not the live price.** The first force-entry limit
+   lands at ~59,940 against a market of ~80,996, is never filled, and is canceled and repriced. A
+   Phase 2 decision source inheriting this pattern would leak a wasted order every cycle; the order
+   manager should take the entry price from the live brief/snapshot, not from a constant in the card.
+2. **The execution ledger row is not merely incomplete, it is wrong.** It reads
+   `status=unfilled_timeout, fill_price=None, fee_paid=None` for a cycle in which the venue filled
+   three ladder slices and opened a position. An unfilled status on a filled order corrupts any cost
+   or hit-rate accounting built on it, so this is a correctness bug, not a completeness gap.
+
 ## Two real bugs, found only by running it against a live venue
 
 1. **Position adjustment was off.** The config never set `position_adjustment_enable`, so freqtrade
