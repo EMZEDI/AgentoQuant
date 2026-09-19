@@ -189,6 +189,22 @@ moment, so the card looks overdue the instant it is created and the recorder wri
 immediately. Harmless today and it does not affect the soak; it would bite a backfill or a replay,
 which is exactly what Phase 1 introduces. Recorded for round 2.
 
+### Production evidence, after merging everything
+
+The soak ran on the merged code at 15:00 and again at 15:08 (a manual fire):
+
+| Signal | Result |
+|---|---|
+| **F2** | verdicts **per decision card**: the ten cards written before the fix each have **2** rows; the two written after it each have **1**. The double write stops exactly at the card where the fix landed |
+| **F3** | the ledger now holds **17 outcome rows** (10 at +1h, 7 at +4h), and the cycle summary reports `outcomes_written: 2` |
+| **F4/F13-adjacent** | the `exit` cycle reported `refused: 1` with a named reason — `no_open_position_for_pair: forceexit needs a trade id and the venue holds no open trade for 'BTC/USD'` — instead of throwing a `TypeError` and marking the whole cycle a venue outage |
+| **F1** | **not yet exercised by a live fill.** All nine execution rows still read `unfilled_timeout` with null fill and fee, but every one predates the write-back fix, and no cycle since has filled. The fix is proven by its own tests and by the sqlite rows the parent quoted; it needs a fill in the soak to be proven live |
+
+A wrong reading worth recording: cycle `15Z-0001` appears to have two verdict rows, which looks like
+the F2 defect surviving the fix. It does not — that cycle was run twice (the timer tick and a manual
+fire) in the same hour, so it has two *cards*, one verdict each. Counting per cycle rather than per
+card is what made it look broken.
+
 ### Credential hygiene
 
 The execution agent disclosed that a `cat` of its scratch venue override printed the local dry-run
