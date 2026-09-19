@@ -153,6 +153,16 @@ class UnsupportedActionError(ValueError):
         super().__init__(message or f"{self.action_name}: {rule_fired}")
 
 
+class PositionReadError(RuntimeError):
+    """The venue's open positions could not be read, so "nothing is open" is not knowable.
+
+    Raised only on the strict path. The difference matters to exactly one caller - the kill switch's
+    close path - where treating an unreadable venue as an empty book makes a ``/flat`` report a clean
+    cycle while every position stays open, and the operator's next action is predicated on it having
+    worked. Anywhere else an empty list is a fine answer; here it is a lie.
+    """
+
+
 class OrderNotPlacedError(RuntimeError):
     """An intent that reached the venue and was refused before any order existed.
 
@@ -549,6 +559,64 @@ class _FreqtradeDryRunTransport:
                 }
             )
         return positions
+
+    def portfolio_risk(self) -> dict[str, Any] | None:
+        """The venue's own loss and drawdown reading, or ``None`` when it cannot be read.
+
+        ``profit_all_ratio`` is the total return as a fraction of the stake, so a negative value is
+        the drawdown the weekly halt is written against. ``/daily`` gives the day's own figure, but
+        this venue answers that endpoint only intermittently (measured: one success in six attempts),
+        so when it fails the all-time figure is used as the day's loss - a superset of the real daily
+        loss, which can only over-trigger a halt, and the safe direction for a safety control. The
+        source used is returned so the difference is visible rather than assumed.
+        """
+        try:
+            report = self._client.profit()
+        except Exception:
+            return None
+        if not isinstance(report, Mapping):
+            return None
+
+        def ratio(*keys: str) -> float | None:
+            for key in keys:
+                value = report.get(key)
+                if value is None:
+                    continue
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        all_ratio = ratio("profit_all_ratio", "profit_closed_ratio")
+        if all_ratio is None:
+            return None
+
+        daily_ratio: float | None = None
+        daily_source = "profit_all_ratio"
+        try:
+            daily_payload = self._client.daily()
+        except Exception:
+            daily_payload = None
+        rows = daily_payload.get("data") if isinstance(daily_payload, Mapping) else None
+        if isinstance(rows, list) and rows:
+            last = rows[-1] if isinstance(rows[-1], Mapping) else None
+            if last is not None:
+                value = last.get("rel_profit")
+                try:
+                    daily_ratio = float(value) if value is not None else None
+                except (TypeError, ValueError):
+                    daily_ratio = None
+                if daily_ratio is not None:
+                    daily_source = "daily"
+
+        used_for_daily = daily_ratio if daily_ratio is not None else all_ratio
+        return {
+            "daily_loss_used_pct": round(abs(min(0.0, used_for_daily)) * 100.0, 6),
+            "drawdown_used_pct": round(abs(min(0.0, all_ratio)) * 100.0, 6),
+            "daily_loss_source": daily_source,
+            "profit_all_ratio": all_ratio,
+        }
 
     def last_price(self, pair: str, *, timeframe: str = "5m") -> float | None:
         """The venue's own last close for ``pair``, or ``None`` when the API does not answer.
@@ -1011,20 +1079,46 @@ class OrderManager:
             detail=f"kill switch: {len(intents)} position(s) to close",
         )
 
-    def open_positions(self) -> list[dict[str, Any]]:
+    def open_positions(self, *, strict: bool = False) -> list[dict[str, Any]]:
         """The venue's open positions, when the transport can report them.
 
         The kill switch closes what is actually open, so the positions come from the venue rather
         than from the card: a ``/flat`` on a tick whose card is a HOLD still has to close everything.
+
+        ``strict=True`` raises :class:`PositionReadError` instead of returning an empty list when the
+        read fails. The close path needs that: "the venue could not be read" and "nothing is open" are
+        different facts, and collapsing the first into the second is how a ``/flat`` reports success
+        while leaving every position open.
         """
         getter = getattr(self.transport, "open_positions", None)
         if not callable(getter):
+            if strict:
+                raise PositionReadError("the transport cannot report open positions")
             return []
         try:
             positions = getter()
-        except Exception:
+        except Exception as exc:
+            if strict:
+                raise PositionReadError(f"{type(exc).__name__}: {exc}") from exc
             return []
         return [dict(row) for row in positions or [] if isinstance(row, Mapping)]
+
+    def portfolio_risk(self) -> dict[str, Any] | None:
+        """The venue's own loss reading, in the units the halts are written in.
+
+        ``{"daily_loss_used_pct": ..., "drawdown_used_pct": ..., "daily_loss_source": ...}``, or
+        ``None`` when the venue could not be read. ``None`` is not "no loss": the caller must record
+        the gap rather than hand a zero to a halt, because a halt that is fed a fabricated zero is a
+        halt that cannot fire.
+        """
+        getter = getattr(self.transport, "portfolio_risk", None)
+        if not callable(getter):
+            return None
+        try:
+            reading = getter()
+        except Exception:
+            return None
+        return dict(reading) if isinstance(reading, Mapping) else None
 
     def venue_price(self, pair: str | None) -> float | None:
         """The venue's own last price for ``pair``, or ``None`` when the transport cannot say."""

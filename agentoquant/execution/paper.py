@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,7 @@ from agentoquant.execution.freqtrade_strategy import placeholder_card, placehold
 from agentoquant.execution.order_manager import (
     OrderManager,
     OrderTransport,
+    PositionReadError,
     freqtrade_dry_run_transport,
 )
 from agentoquant.execution.signal_store import SignalStore
@@ -118,6 +120,8 @@ def placeholder_context(
     book_value_cad: float,
     now: datetime | None = None,
     halts: HaltState | None = None,
+    daily_loss_used_pct: float = 0.0,
+    drawdown_used_pct: float = 0.0,
 ) -> PortfolioContext:
     """The Phase 0 context the Risk Gate evaluates against.
 
@@ -171,6 +175,11 @@ def placeholder_context(
         # data it describes: two cadences, the same margin the gate assumes.
         market_data_max_age_s=market_data_max_age_s(),
         halts=halts if halts is not None else HaltState(),
+        # The same numbers the kill switch was evaluated with, so the gate's own halt rules and the
+        # switch cannot disagree. Left unset they sat at their 0.0 defaults and neither halt rule
+        # could ever fire, which is what made the automatic halts unreachable.
+        daily_loss_used_pct=daily_loss_used_pct,
+        drawdown_used_pct=drawdown_used_pct,
         now=now,
     )
 
@@ -199,6 +208,20 @@ def cycle_cost_usd(ledger: LedgerStore, cycle_id: str) -> float:
 # ----------------------------------------------------------------------------------------------
 # One cycle
 # ----------------------------------------------------------------------------------------------
+
+
+def _close_targets(pending_coins: Sequence[str]) -> list[Any]:
+    """The halt's own recorded positions, for a tick that could not read the venue.
+
+    Used only when the venue read failed. When the venue *answers*, its answer is authoritative: a
+    position it no longer reports is gone, and re-planning a close for it would never stop.
+    """
+    merged: dict[str, Any] = {}
+    for coin in pending_coins:
+        key = str(coin).split("/")[0].upper()
+        if key:
+            merged[key] = {"coin": coin}
+    return list(merged.values())
 
 
 def run_cycle(
@@ -243,6 +266,29 @@ def run_cycle(
     book_value_cad = float(load_settings().capital.starting_capital)
     reference_price = price if price is not None else placeholder_price(card.coin)
     switches = kill_switch or build_kill_switch(limits, ledger=ledger)
+    orders = manager or OrderManager(
+        ledger=ledger,
+        transport=transport,
+        limits=limits,
+        fee_tiers=fee_tiers,
+        book_value_cad=book_value_cad,
+    )
+
+    # 2b. the automatic halts. ``KillSwitch.evaluate`` had no caller anywhere in the package, so the
+    # daily loss halt and the weekly drawdown halt could not fire in the running system at all, and
+    # the gate's own halt rules could not fire either because the context left both counters at 0.0.
+    # The numbers come from the venue. When it cannot be read the gap is *recorded* rather than
+    # passed off as a zero: a halt fed a fabricated zero is a halt that cannot fire.
+    risk_reading = orders.portfolio_risk()
+    daily_loss_used_pct = float(risk_reading["daily_loss_used_pct"]) if risk_reading else 0.0
+    drawdown_used_pct = float(risk_reading["drawdown_used_pct"]) if risk_reading else 0.0
+    switches.evaluate(
+        daily_loss_used_pct=daily_loss_used_pct,
+        drawdown_used_pct=drawdown_used_pct,
+        positions=orders.open_positions(),
+        cycle_id=cycle_id,
+    )
+
     context = placeholder_context(
         card,
         price=reference_price,
@@ -250,6 +296,8 @@ def run_cycle(
         book_value_cad=book_value_cad,
         now=moment,
         halts=switches.halt_state(),
+        daily_loss_used_pct=daily_loss_used_pct,
+        drawdown_used_pct=drawdown_used_pct,
     )
     verdict = RiskGate(limits, ledger=ledger).evaluate(card, context)
     verdict_id = ledger.write(
@@ -265,13 +313,6 @@ def run_cycle(
     signal_path = store.publish(card, verdict, cycle_id=cycle_id)
 
     # 4. turn the verdict into intents and submit them, dry-run only
-    orders = manager or OrderManager(
-        ledger=ledger,
-        transport=transport,
-        limits=limits,
-        fee_tiers=fee_tiers,
-        book_value_cad=book_value_cad,
-    )
     stop_price = context.stop_price
     plan = orders.plan(
         card,
@@ -297,13 +338,41 @@ def run_cycle(
 
     # 4b. a halt closes what is open. The kill switch places nothing itself: it returns the plans, and
     # they go through the same order manager and the same dry-run transport as every other exit.
+    #
+    # Two things here are deliberate. The venue read is *strict*, because "the venue could not be
+    # read" and "nothing is open" are different facts and collapsing them is how a /flat reported
+    # `closes: 0, errors: 0, degraded: false`, exited 0 and left every position open. And the close
+    # list is the union of the venue's answer with the halt's own persisted list, so a position a
+    # previous tick recorded is still attempted on a tick that cannot read the venue. A halt that
+    # cannot confirm its flat stays latched and says so.
     halt_state = switches.halt_state()
     closes: list[Any] = []
+    closes_error: str | None = None
     if halt_state.entries_blocked:
-        targets: list[Any] = orders.open_positions() or [
-            {"coin": coin} for coin in switches.status().positions_to_close
-        ]
+        venue_positions: list[Any] | None = None
+        try:
+            venue_positions = orders.open_positions(strict=True)
+        except PositionReadError as exc:
+            closes_error = f"{type(exc).__name__}: {exc}"
+        if venue_positions is not None:
+            # The venue answered, so its answer is authoritative: a position it no longer reports is
+            # gone, and confirm_closes below clears the halt's stale pending list. Falling back to the
+            # pending list here would keep re-planning a close for a position that has already closed.
+            targets: list[Any] = list(venue_positions)
+        else:
+            # The venue could not be read, so fall back to what the halt itself recorded: a position an
+            # earlier tick saw must still be attempted rather than silently forgotten.
+            targets = _close_targets(switches.status().positions_to_close)
         closes = switches.close_all_orders(targets, reason=", ".join(halt_state.reasons) or None)
+        if closes or closes_error:
+            switches.note_closes_unconfirmed(
+                reason=closes_error or f"{len(closes)} position(s) still open",
+                pending=targets,
+                cycle_id=cycle_id,
+            )
+        else:
+            # The venue was read and nothing is open, so the flat is proven.
+            switches.confirm_closes(cycle_id=cycle_id)
     if closes and venue_available:
         try:
             reports.extend(
@@ -319,6 +388,17 @@ def run_cycle(
     # 5. the bridge's ack, if it has answered yet
     ack = _await_ack(store, cycle_id, ack_wait_s)
 
+    errors = sum(1 for r in reports if r.get("error"))
+    if venue_error is None:
+        # Per-intent isolation is right (one refused leg must not discard the ladder), but it removed
+        # the only signal that reported an outage: a cycle whose every leg failed to reach the venue
+        # reported `errors: 3, degraded: false` and exited 0. The first per-intent error now survives
+        # as the cycle's venue_error, and `degraded` below is derived from it.
+        first_error = next((r for r in reports if r.get("error")), None)
+        if first_error is not None:
+            # ``error`` is a bool flag; the message is in ``reason``.
+            venue_error = str(first_error.get("reason") or "venue error")
+
     summary: dict[str, Any] = {
         "cycle_id": cycle_id,
         "sequence": sequence,
@@ -333,17 +413,29 @@ def run_cycle(
         "orders": sum(1 for r in reports if r.get("submitted")),
         "strategy_paths": sum(1 for r in reports if r.get("handled_by") == "strategy"),
         "refused": sum(1 for r in reports if r.get("rule_fired")),
-        "errors": sum(1 for r in reports if r.get("error")),
+        "errors": errors,
         "fills": sum(1 for r in reports if r.get("status") == "filled"),
         "fees_paid": round(sum(float(r.get("fee_paid") or 0.0) for r in reports), 10),
         "fee_tier": fee_tiers.current_tier,
         "cost_usd": cycle_cost_usd(ledger, cycle_id),
         "ack": "acked" if ack else "pending",
         "halts": switches.halt_state().as_dict(),
+        "halt_status": switches.status().as_dict(),
+        "halt_inputs": risk_reading if risk_reading is not None else {"available": False},
+        # Visible on its own rather than folded into `degraded`: the halt *state* is still consumed
+        # and still blocks entries when the venue cannot be read, so the cycle is not degraded in the
+        # execution sense - but the automatic trigger is blind, and that must not be invisible.
+        "halt_inputs_available": risk_reading is not None,
         "closes": len(closes),
+        "closes_error": closes_error,
+        "closes_unconfirmed": switches.status().closes_unconfirmed,
         "venue_available": venue_available,
         "venue_error": venue_error,
-        "degraded": not venue_available and bool(plan.intents),
+        # Derived, not a flag. Per-intent isolation means nothing raises for a venue error any more,
+        # so a cycle whose every leg failed to reach the venue, or whose halt could not read it,
+        # reported `degraded: false` and exited 0: an outage and a quiet hold looked identical to
+        # every consumer, including the systemd unit that only checks the exit code.
+        "degraded": bool(errors) or bool(closes_error) or (not venue_available and bool(plan.intents)),
         "context_source": "placeholder",
         "signal_path": str(signal_path),
         "decision_card_id": card_id,
@@ -494,7 +586,68 @@ def run_loop(
     }
 
 
-def main(cycle_id: str | None = None, placeholder: bool = False, hours: int = 1) -> dict[str, Any]:
+def human_halt_command(command: str, *, cycle_id: str | None = None) -> dict[str, Any]:
+    """Raise or clear a halt from outside the loop: the human path behind Telegram's ``/flat``.
+
+    Nothing in the package called ``trigger_flat`` and nothing called ``KillSwitch.evaluate``, so the
+    panic button and the automatic halts had no production entry point at all: a control a human
+    cannot reach is not yet a control. This is the smallest honest version of the missing trigger. The
+    command records the human action, persists the halt, and the loop run that follows it in the same
+    invocation is the close cycle that carries the flat out.
+
+    The positions come from the venue, and a venue that cannot be read leaves the halt **latched and
+    unconfirmed** rather than reporting a clean flat: an unreadable venue is not an empty book.
+    """
+    ledger = LedgerStore()
+    ledger.migrate()
+    switches = build_kill_switch(ledger=ledger)
+    orders = OrderManager(
+        ledger=ledger,
+        transport=freqtrade_dry_run_transport(),
+        limits=load_risk_limits(),
+        fee_tiers=load_fee_tiers(),
+        book_value_cad=float(load_settings().capital.starting_capital),
+    )
+    positions: list[Any] = []
+    positions_error: str | None = None
+    try:
+        positions = orders.open_positions(strict=True)
+    except PositionReadError as exc:
+        positions_error = f"{type(exc).__name__}: {exc}"
+
+    if command == "resume":
+        status = switches.resume(actor="cli:/resume", human=True, cycle_id=cycle_id)
+    else:
+        switches.trigger_flat(
+            actor="cli:/flat",
+            reason="human /flat",
+            positions=positions,
+            cycle_id=cycle_id,
+        )
+        if positions_error:
+            status = switches.note_closes_unconfirmed(
+                reason=positions_error,
+                pending=switches.status().positions_to_close,
+                cycle_id=cycle_id,
+            )
+        else:
+            status = switches.status()
+
+    return {
+        "command": command,
+        "halt": status.as_dict(),
+        "positions_read": len(positions),
+        "positions_read_error": positions_error,
+    }
+
+
+def main(
+    cycle_id: str | None = None,
+    placeholder: bool = False,
+    hours: int = 1,
+    flat: bool = False,
+    resume: bool = False,
+) -> dict[str, Any]:
     """``agentoquant paper``. Runs the hourly loop in paper mode and returns a CLI-shaped result.
 
     Dry-run only. The command never prompts, never needs a terminal and never places a real order.
@@ -515,6 +668,12 @@ def main(cycle_id: str | None = None, placeholder: bool = False, hours: int = 1)
             "placeholder_available": True,
             "usage": "agentoquant paper --placeholder --hours 1",
         }
+    # The human halt is applied *before* the loop runs, so the run in the same invocation is the
+    # close cycle that carries a /flat out.
+    halt: dict[str, Any] | None = None
+    if flat or resume:
+        halt = human_halt_command("resume" if resume else "flat", cycle_id=cycle_id)
+
     result = run_loop(hours=hours, placeholder=placeholder, cycle_id=cycle_id, sleep=True)
     completed, failed = int(result["completed"]), int(result["failed"])
     message = (
@@ -529,6 +688,7 @@ def main(cycle_id: str | None = None, placeholder: bool = False, hours: int = 1)
         "cycles": result["cycles"],
         "completed": completed,
         "failed": failed,
+        "halt": halt,
         "ledger": result["ledger"],
         "signal_dir": result["signal_dir"],
         "log_path": result["log_path"],

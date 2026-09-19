@@ -105,6 +105,13 @@ class PaperInput(CommandInput):
         default=False, description="Use the Phase 0 placeholder decision source instead of the cascade"
     )
     hours: int = Field(default=1, ge=1, description="How many hourly cycles to run")
+    flat: bool = Field(
+        default=False,
+        description="Raise the human halt (/flat): close every open position and block new entries",
+    )
+    resume: bool = Field(
+        default=False, description="Clear the human halt (/resume), including the weekly drawdown halt"
+    )
 
 
 class ReviewInput(CommandInput):
@@ -564,8 +571,17 @@ def paper(
         False, "--placeholder", help="Phase 0 placeholder decision source instead of the cascade"
     ),
     hours: int = typer.Option(1, "--hours", help="How many hourly cycles to run"),
+    flat: bool = typer.Option(
+        False, "--flat", help="Raise the human halt (/flat): close every position, block new entries"
+    ),
+    resume: bool = typer.Option(
+        False, "--resume", help="Clear the human halt (/resume), including the weekly drawdown halt"
+    ),
 ) -> None:
-    _invoke("paper", PaperInput(cycle_id=cycle_id, placeholder=placeholder, hours=hours))
+    _invoke(
+        "paper",
+        PaperInput(cycle_id=cycle_id, placeholder=placeholder, hours=hours, flat=flat, resume=resume),
+    )
 
 
 @app.command("review", help="Build and optionally send the daily review.")

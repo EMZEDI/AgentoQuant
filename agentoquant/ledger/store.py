@@ -30,9 +30,14 @@ event-driven (the executor writes it when the position closes), so it is never i
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
-from collections.abc import Sequence
+import random
+import threading
+import time
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
@@ -53,6 +58,72 @@ from agentoquant.ledger.schema import (
 
 #: Environment override, mirroring ``cli.call_log_path()``'s ``AGENTOQUANT_CALL_LOG`` convention.
 DB_PATH_ENV = "AGENTOQUANT_LEDGER_PATH"
+
+#: How hard the store tries to open a ledger another process is holding. DuckDB is single-writer and
+#: this store opens a short-lived connection per operation, so two processes touching the file at the
+#: same instant collide. The cross-process lock below is the real fix; this retry is the backstop for
+#: a holder that does not take the sidecar lock (an older process, or a tool opening the file by hand).
+CONNECT_ATTEMPTS = 8
+CONNECT_BACKOFF_S = 0.05
+CONNECT_BACKOFF_MAX_S = 0.5
+
+
+class _ReentrantFileLock:
+    """An advisory cross-process lock that one thread may take more than once.
+
+    DuckDB takes its **own** per-process lock on the database file and holds it while any connection
+    is open, so two processes in a tight write loop starve each other: measured, a retry alone got two
+    of three processes through and left the third starved for the whole retry window. Serialising on
+    a sidecar lock file means only one process ever reaches DuckDB's lock, so the collision cannot
+    happen at all.
+
+    The depth counter makes it reentrant within a process: ``write`` calls ``query`` internally, and a
+    second ``flock`` on the same handle from the same thread would deadlock against itself.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._local = threading.local()
+
+    def _depth(self) -> int:
+        return int(getattr(self._local, "depth", 0))
+
+    def __enter__(self) -> _ReentrantFileLock:
+        depth = self._depth()
+        if depth == 0:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(self.path, "a+", encoding="utf-8")
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            self._local.handle = handle
+        self._local.depth = depth + 1
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        depth = self._depth() - 1
+        self._local.depth = depth
+        if depth == 0:
+            handle = getattr(self._local, "handle", None)
+            if handle is not None:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                finally:
+                    handle.close()
+                self._local.handle = None
+
+
+_LOCKS_GUARD = threading.Lock()
+_LOCKS: dict[str, _ReentrantFileLock] = {}
+
+
+def file_lock_for(db_path: Path) -> _ReentrantFileLock:
+    """The process-wide lock for one ledger file, so every store on it shares one handle."""
+    key = str(db_path)
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(key)
+        if lock is None:
+            lock = _ReentrantFileLock(Path(f"{db_path}.lock"))
+            _LOCKS[key] = lock
+    return lock
 
 #: How long after a decision card each time-based outcome horizon falls due. ``exit`` is not
 #: time-based: the executor writes it when the position closes.
@@ -82,6 +153,17 @@ class LedgerSchemaError(LedgerError):
 
 class LedgerWriteError(LedgerError):
     """A write was refused: wrong payload, missing cycle id, conflicting envelope, duplicate outcome."""
+
+
+class LedgerLockError(LedgerError):
+    """The ledger file is locked by another process and the retries were exhausted.
+
+    DuckDB permits one writer at a time and this store opens a short-lived connection per operation,
+    so two processes that open the file at the same instant collide. The lock is released as soon as
+    the other connection closes, which is why a bounded retry absorbs it - but when it cannot, the
+    failure is named rather than surfacing as a bare ``duckdb.IOException`` out of a constructor,
+    where the paper loop would die before its own error handling.
+    """
 
 
 # ----------------------------------------------------------------------------------------------
@@ -228,15 +310,54 @@ class LedgerStore:
     def __init__(self, db_path: Path | str | None = None) -> None:
         self.db_path = Path(db_path) if db_path is not None else default_db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = file_lock_for(self.db_path)
         self.migrate()
 
     # -- connection --------------------------------------------------------------------------
 
     def _connect(self) -> duckdb.DuckDBPyConnection:
-        """Open a fresh connection. DuckDB is single-writer, so connections never linger."""
-        connection = duckdb.connect(str(self.db_path))
-        connection.execute("SET TimeZone='UTC'")
-        return connection
+        """Open a fresh connection, retrying while another process holds the file lock.
+
+        DuckDB is single-writer, so a second process opening the same file at the same instant gets
+        ``Conflicting lock is held``. The lock is released as soon as the short-lived connection
+        closes, so a bounded retry with jitter absorbs the collision: without it two production
+        processes cannot share the ledger the plan calls the single source of truth, and the failure
+        lands in ``__init__`` as an uncaught ``IOException``.
+        """
+        delay = CONNECT_BACKOFF_S
+        last: Exception | None = None
+        for attempt in range(CONNECT_ATTEMPTS):
+            try:
+                connection = duckdb.connect(str(self.db_path))
+            except duckdb.IOException as exc:
+                last = exc
+                if attempt == CONNECT_ATTEMPTS - 1:
+                    break
+                # Jittered, so two processes retrying in lockstep do not collide again on every try.
+                time.sleep(delay * (0.5 + random.random()))
+                delay = min(delay * 2, CONNECT_BACKOFF_MAX_S)
+                continue
+            connection.execute("SET TimeZone='UTC'")
+            return connection
+        raise LedgerLockError(
+            f"could not open {self.db_path} after {CONNECT_ATTEMPTS} attempts: "
+            f"{type(last).__name__}: {last}"
+        ) from last
+
+    @contextmanager
+    def _connection(self) -> Iterator[duckdb.DuckDBPyConnection]:
+        """A connection held under the cross-process lock and closed on the way out.
+
+        Every path that touches the file goes through here, so only one process ever reaches DuckDB's
+        own lock and the two can share the ledger the plan calls the single source of truth. The
+        connection is always closed: DuckDB's lock is held while any connection is open.
+        """
+        with self._lock:
+            connection = self._connect()
+            try:
+                yield connection
+            finally:
+                connection.close()
 
     def close(self) -> None:
         """No persistent connection is held, so this is a no-op kept for the frozen interface."""
@@ -246,8 +367,7 @@ class LedgerStore:
 
     def migrate(self) -> None:
         """Create the fourteen tables (and their cycle_id indexes). Idempotent, safe to re-run."""
-        connection = self._connect()
-        try:
+        with self._connection() as connection:
             for stage in Stage:
                 table = STAGE_TABLES[stage]
                 columns = ", ".join(f'"{name}" {kind}' for name, kind in TABLE_COLUMNS[stage])
@@ -256,8 +376,6 @@ class LedgerStore:
                     f'CREATE INDEX IF NOT EXISTS "idx_{table}_cycle_id" '
                     f'ON "{table}" ("cycle_id")'
                 )
-        finally:
-            connection.close()
 
     def tables(self) -> list[str]:
         """The ledger's table names, sorted."""
@@ -336,13 +454,10 @@ class LedgerStore:
         names = ", ".join(f'"{name}"' for name, _ in columns)
         placeholders = ", ".join("?" for _ in columns)
         values = [_to_db(row.get(name)) for name, _ in columns]
-        connection = self._connect()
-        try:
+        with self._connection() as connection:
             connection.execute(
                 f'INSERT INTO "{STAGE_TABLES[stage]}" ({names}) VALUES ({placeholders})', values
             )
-        finally:
-            connection.close()
         return envelope.record_id
 
     def _coerce_payload(
@@ -401,8 +516,7 @@ class LedgerStore:
 
     def query(self, sql: str, params: Sequence | None = None) -> list[dict]:
         """Run one statement and return rows as dicts. JSON columns decode, timestamps are UTC."""
-        connection = self._connect()
-        try:
+        with self._connection() as connection:
             cursor = connection.execute(sql, params if params is not None else [])
             description = cursor.description or []
             names = [column[0] for column in description]
@@ -412,8 +526,6 @@ class LedgerStore:
                 if len(column) > 1 and _is_json_column(column[1])
             }
             rows = cursor.fetchall()
-        finally:
-            connection.close()
         return [
             {
                 name: _from_db(value, index in json_indexes)
@@ -546,14 +658,11 @@ class LedgerStore:
                     f"outcome already recorded for card {decision_card_id!r} at horizon "
                     f"{horizon!r}; pass replace=True to overwrite"
                 )
-            connection = self._connect()
-            try:
+            with self._connection() as connection:
                 connection.execute(
                     'DELETE FROM "outcome" WHERE "decision_card_id" = ? AND "horizon" = ?',
                     [decision_card_id, horizon],
                 )
-            finally:
-                connection.close()
         payload = OutcomePayload(
             decision_card_id=decision_card_id,
             horizon=horizon,

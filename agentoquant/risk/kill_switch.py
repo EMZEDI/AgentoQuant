@@ -140,6 +140,11 @@ class KillSwitchStatus:
     daily_halt_expires_at: datetime | None
     weekly_halt_requires_human_restart: bool
     resumed_by_human: bool = False
+    #: Whether the halt's own flat is still unproven. A halt that could not read the venue, or that
+    #: still has positions to close, stays latched and says so: reporting a clean flat when nothing
+    #: was closed is the worst failure this control has, because the operator's next action is
+    #: predicated on it having worked.
+    closes_unconfirmed: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -156,6 +161,7 @@ class KillSwitchStatus:
             ),
             "weekly_halt_requires_human_restart": self.weekly_halt_requires_human_restart,
             "resumed_by_human": self.resumed_by_human,
+            "closes_unconfirmed": self.closes_unconfirmed,
         }
 
 
@@ -198,6 +204,7 @@ class KillSwitch:
         self._pending_closes: tuple[str, ...] = ()
         self._last_reason: str | None = None
         self._resumed_by_human = False
+        self._closes_unconfirmed = False
         self.state_path: Path = Path(state_path) if state_path is not None else default_state_path()
         self.persist = bool(persist)
         self.restore()
@@ -213,6 +220,7 @@ class KillSwitch:
             "pending_closes": list(self._pending_closes),
             "last_reason": self._last_reason,
             "resumed_by_human": self._resumed_by_human,
+            "closes_unconfirmed": self._closes_unconfirmed,
         }
 
     def restore(self) -> HaltState:
@@ -244,6 +252,7 @@ class KillSwitch:
         reason = payload.get("last_reason")
         self._last_reason = str(reason) if reason else None
         self._resumed_by_human = bool(payload.get("resumed_by_human"))
+        self._closes_unconfirmed = bool(payload.get("closes_unconfirmed"))
         return self.halt_state()
 
     def save(self) -> None:
@@ -302,6 +311,7 @@ class KillSwitch:
             daily_halt_expires_at=self.daily_halt_expires_at(),
             weekly_halt_requires_human_restart=self.limits.halts.weekly_halt_requires_human_restart,
             resumed_by_human=self._resumed_by_human,
+            closes_unconfirmed=self._closes_unconfirmed,
         )
 
     def is_entry_blocked(self) -> bool:
@@ -322,6 +332,10 @@ class KillSwitch:
         self._last_reason = reason
         self._resumed_by_human = False
         self._pending_closes = self._coins(positions)
+        # Raising a halt does not confirm it. It is confirmed by a close cycle that read the venue
+        # successfully and found nothing left to close, so a halt with positions to close starts
+        # unconfirmed and stays that way until that cycle happens.
+        self._closes_unconfirmed = bool(self._pending_closes)
         self._record_human_action(COMMAND_FLAT, actor, cycle_id)
         self.save()
         return self.status()
@@ -339,6 +353,10 @@ class KillSwitch:
             self._daily_halt_at = self.now()
         self._last_reason = reason
         self._pending_closes = self._coins(positions)
+        # Raising a halt does not confirm it. It is confirmed by a close cycle that read the venue
+        # successfully and found nothing left to close, so a halt with positions to close starts
+        # unconfirmed and stays that way until that cycle happens.
+        self._closes_unconfirmed = bool(self._pending_closes)
         self._record_human_action(COMMAND_PAUSE, actor, cycle_id)
         self.save()
         return self.status()
@@ -356,6 +374,10 @@ class KillSwitch:
             self._weekly_halt_at = self.now()
         self._last_reason = reason
         self._pending_closes = self._coins(positions)
+        # Raising a halt does not confirm it. It is confirmed by a close cycle that read the venue
+        # successfully and found nothing left to close, so a halt with positions to close starts
+        # unconfirmed and stays that way until that cycle happens.
+        self._closes_unconfirmed = bool(self._pending_closes)
         self._record_human_action(COMMAND_PAUSE, actor, cycle_id)
         self.save()
         return self.status()
@@ -379,6 +401,7 @@ class KillSwitch:
             cleared_weekly = self._weekly_halt_at is not None
             self._weekly_halt_at = None
         self._pending_closes = ()
+        self._closes_unconfirmed = False
         self._resumed_by_human = bool(human and cleared_weekly)
         self._record_human_action(COMMAND_RESUME, actor, cycle_id)
         self.save()
@@ -416,6 +439,41 @@ class KillSwitch:
         return self.status()
 
     # -- closing positions ---------------------------------------------------------------------
+
+    def note_closes_unconfirmed(
+        self,
+        *,
+        reason: str,
+        pending: Sequence[object] = (),
+        cycle_id: str | None = None,
+    ) -> KillSwitchStatus:
+        """Record that a halt's flat is **not** proven, and keep it latched.
+
+        Called when the close cycle could not read the venue, or when it still had positions left to
+        close. The halt stays raised (entries blocked) and its status says ``closes_unconfirmed``, so
+        neither the operator nor the next tick can mistake a failed close for a completed one.
+        """
+        if pending:
+            coins = self._coins(pending)
+            # Keep what the previous tick recorded as well: a position the venue could not confirm
+            # must not be forgotten just because this tick could not read it either.
+            merged = list(dict.fromkeys([*self._pending_closes, *coins]))
+            self._pending_closes = tuple(merged)
+        self._closes_unconfirmed = True
+        self._last_reason = reason
+        self.save()
+        return self.status()
+
+    def confirm_closes(self, *, cycle_id: str | None = None) -> KillSwitchStatus:
+        """Record that a halt's flat is proven: the venue was read and nothing is left open.
+
+        Only this clears ``closes_unconfirmed`` and the pending list. It never clears the halt
+        itself - that is ``resume``'s job, and for the weekly drawdown halt only a human may do it.
+        """
+        self._closes_unconfirmed = False
+        self._pending_closes = ()
+        self.save()
+        return self.status()
 
     def close_all_orders(
         self,
