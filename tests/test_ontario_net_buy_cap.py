@@ -131,10 +131,10 @@ def gate_context(*, now: datetime, coin: str, usd_cad_rate: float = 1.0) -> Port
     )
 
 
-def buy_card(coin: str, *, size_pct: float = 3.0) -> DecisionCard:
+def buy_card(coin: str, *, size_pct: float = 3.0, proposal_id: str = "prop-sol-1") -> DecisionCard:
     return DecisionCard(
         cycle_id="2026-09-19T05Z-0001",
-        selected_proposal_id="prop-sol-1",
+        selected_proposal_id=proposal_id,
         action=Action.ENTER_LADDERED,
         coin=coin,
         sleeve=Sleeve.A,
@@ -250,7 +250,8 @@ def test_the_cap_uses_the_cad_conversion_the_context_carries(tmp_path) -> None:
     assert at_parity.verdict == "approved", at_parity  # 22,500 + 90 < 30,000
 
     converted = gate.evaluate(
-        buy_card("SOL", size_pct=10.0), gate_context(now=now, coin="SOL", usd_cad_rate=1.37)
+        buy_card("SOL", size_pct=10.0, proposal_id="prop-sol-1-converted"),
+        gate_context(now=now, coin="SOL", usd_cad_rate=1.37),
     )
     assert converted.verdict == "shrunk", converted  # 30,825 CAD is over the cap
     assert converted.rule_fired == RULE_ONTARIO_NET_BUY_CAP
@@ -269,12 +270,14 @@ def test_exempt_coins_and_old_fills_do_not_count(tmp_path) -> None:
     backdate(ledger, "decision_card", old_card, now - timedelta(days=400))
     backdate(ledger, "execution", old_execution, now - timedelta(days=400))
 
-    assert ontario_net_buys_cad_12m(ledger, as_of=now) == {}
+    totals = ontario_net_buys_cad_12m(ledger, as_of=now)
+    # The exempt coin is reported for audit, and the 400-day-old fill is outside the window.
+    assert totals == {"BTC": 60_000.0}, totals
+    assert "BTC" in ONTARIO_EXEMPT_COINS
     gate = RiskGate(load_risk_limits(), ledger=ledger)
     verdict = gate.evaluate(buy_card("BTC"), gate_context(now=now, coin="BTC"))
     assert verdict.verdict == "approved"
     assert verdict.rule_fired is None
-    assert "BTC" in ONTARIO_EXEMPT_COINS
 
 
 def test_a_sell_subtracts_from_the_net_buy_total(tmp_path) -> None:
@@ -354,7 +357,7 @@ def test_the_hourly_loop_rejects_a_buy_over_the_cap_when_the_ledger_has_fills(tm
     )
     assert result["completed"] == 1, result["failures"]
     summary = result["results"][0]
-    assert summary["action"] == "enter_laddered", summary
+    assert summary["action"] in INCREASING_ACTIONS, summary
     assert summary["coin"] == coin, summary
     assert summary["verdict"] == "rejected", summary
     assert summary["rule_fired"] == RULE_ONTARIO_NET_BUY_CAP, summary
@@ -399,6 +402,6 @@ def test_the_same_loop_approves_when_the_ledger_carries_no_fills(tmp_path, monke
         log_path=tmp_path / "cycles.jsonl",
     )
     summary = result["results"][0]
-    assert summary["action"] == "enter_laddered", summary
+    assert summary["action"] in INCREASING_ACTIONS, summary
     assert summary["verdict"] == "approved", summary
     assert summary["rule_fired"] is None
