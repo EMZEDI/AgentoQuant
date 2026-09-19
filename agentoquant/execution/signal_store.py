@@ -43,6 +43,10 @@ SIGNAL_DIR_ENV = "AGENTOQUANT_SIGNAL_DIR"
 #: Bumped when the document shape changes; the strategy refuses an unknown version.
 DOCUMENT_SCHEMA_VERSION = 1
 
+#: The currency the venue sizes and fills in. ``config/settings.yaml`` carries the book in CAD; the
+#: venue trades USD pairs, so the approved notional is published in the venue's own currency.
+STAKE_CURRENCY = "USD"
+
 #: The file the bridge polls.
 CURRENT_NAME = "current.json"
 HISTORY_DIR = "history"
@@ -126,12 +130,20 @@ def execution_intent(card: DecisionCard, verdict: RiskGateVerdict) -> dict[str, 
     else:
         order_type = "post_only_limit"
     slices = DEFAULT_LADDER_SLICES if action == Action.ENTER_LADDERED else 2 if action == Action.ADD else 1
+    size_pct = float(verdict.final_size_pct) if approved else 0.0
     return {
         "approved": approved,
         "side": side,
         "order_type": order_type,
-        "size_pct": float(verdict.final_size_pct) if approved else 0.0,
+        "size_pct": size_pct,
         "original_size_pct": float(verdict.original_size_pct),
+        # The money the gate approved, in the venue's stake currency. It travels so the bridge places
+        # exactly the size the gate approved. The bridge used to re-derive the size from a percentage
+        # of the *venue's wallet* instead, and the two bases are different numbers: with a 900 CAD book
+        # and an 854.77 USD venue wallet an approved 3 percent is 27.00, but three slices of
+        # 8.5477 were placed - 25.64, 4.999 percent short of what was approved.
+        "stake_amount": approved_notional(size_pct),
+        "stake_currency": STAKE_CURRENCY,
         "ladder_slices": slices,
         "ladder_offsets_pct": list(LADDER_OFFSETS_PCT) if action in ENTRY_ACTIONS else [],
         "stop_price": None,
@@ -145,6 +157,24 @@ def execution_intent(card: DecisionCard, verdict: RiskGateVerdict) -> dict[str, 
         "post_only": order_type == "post_only_limit",
         "rule_fired": verdict.rule_fired,
     }
+
+
+def approved_notional(size_pct: float) -> float:
+    """The money a gate verdict approves: ``size_pct`` of the book, in the venue's stake currency.
+
+    This is the number that must travel to the bridge. The bridge used to recompute the size as a
+    percentage of the venue's *wallet*, which is a different base from the configured book: an approved
+    3 percent of a 900 CAD book is 27.00, while 1 percent of the venue's 854.77 USD wallet is 8.5477
+    per slice and 25.64 across three - 4.999 percent short, which is exactly what the ack exposed.
+
+    Returns 0.0 when the book cannot be read, so a document with no trustworthy notional publishes
+    zero and the strategy refuses rather than guessing a size.
+    """
+    try:
+        book_value = float(load_settings().capital.starting_capital)
+    except Exception:
+        return 0.0
+    return round(book_value * float(size_pct) / 100.0, 8)
 
 
 def signal_document(

@@ -24,6 +24,7 @@ cycle summary records ``context_source: "placeholder"`` so a reader is never mis
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
@@ -54,6 +55,10 @@ from agentoquant.risk.kill_switch import HaltState, KillSwitch, build_kill_switc
 #: Where the loop writes its own log, one JSON object per line.
 LOG_SUBDIR = "paper"
 CYCLE_LOG_NAME = "cycles.jsonl"
+
+#: Environment override for the cycle log path. The cycle log is the soak's acceptance evidence, so a
+#: test run must not be able to append to it.
+CYCLE_LOG_ENV = "AGENTOQUANT_CYCLE_LOG"
 
 #: The placeholder market snapshot the Phase 0 gate is evaluated against. Phase 2 replaces this with
 #: the real snapshot from the ingest stage; the numbers are fixed so cycles are reproducible.
@@ -93,6 +98,16 @@ def log_dir() -> Path:
 
 
 def cycle_log_path() -> Path:
+    """Where the cycle log goes: ``AGENTOQUANT_CYCLE_LOG`` if set, else the configured log dir.
+
+    The override exists because this file **is** the unattended soak's acceptance evidence, and it was
+    the repo's default path for every process on the box. A dev run, a test run or a scratch probe
+    therefore appended its own cycles to the same file the checkpoint is judged on: a real test run
+    left ``/tmp/pytest-of-shahrad/...`` cycle rows in it. Tests set the override; the soak does not.
+    """
+    override = os.environ.get(CYCLE_LOG_ENV)
+    if override:
+        return Path(override)
     return log_dir() / LOG_SUBDIR / CYCLE_LOG_NAME
 
 

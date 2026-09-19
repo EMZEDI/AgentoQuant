@@ -18,11 +18,14 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
+from agentoquant.enums import Stage
 from agentoquant.execution.order_manager import OrderManager, PositionReadError
 from agentoquant.execution.paper import human_halt_command, run_cycle
 from agentoquant.execution.signal_store import SignalStore
+from agentoquant.ledger.schema import HumanActionPayload
 from agentoquant.ledger.store import LedgerStore
 from agentoquant.risk.kill_switch import KillSwitch, build_kill_switch
 
@@ -224,7 +227,9 @@ def test_a_total_venue_failure_marks_the_cycle_degraded(tmp_path: Path) -> None:
 
 def test_a_clean_cycle_is_not_degraded(tmp_path: Path) -> None:
     healthy = StandInVenue()
-    summary = _cycle(tmp_path, healthy, "b4-clean", switches=build_kill_switch(state_path=tmp_path / "b4c.json"))
+    summary = _cycle(
+        tmp_path, healthy, "b4-clean", switches=build_kill_switch(state_path=tmp_path / "b4c.json")
+    )
     assert summary["errors"] == 0
     assert summary["degraded"] is False
 
@@ -264,7 +269,9 @@ def test_the_weekly_drawdown_halt_fires_from_the_venues_own_reading(tmp_path: Pa
 def test_an_unreadable_risk_reading_is_recorded_rather_than_passed_off_as_zero(tmp_path: Path) -> None:
     """``None`` is not "no loss": a halt fed a fabricated zero is a halt that cannot fire."""
     blind = StandInVenue(fail_positions=True)
-    summary = _cycle(tmp_path, blind, "b2-blind", switches=build_kill_switch(state_path=tmp_path / "b2b.json"))
+    summary = _cycle(
+        tmp_path, blind, "b2-blind", switches=build_kill_switch(state_path=tmp_path / "b2b.json")
+    )
 
     assert summary["halt_inputs"] == {"available": False}
     assert summary["halt_inputs_available"] is False
@@ -410,10 +417,6 @@ def test_three_independent_processes_can_write_one_ledger(tmp_path: Path) -> Non
 def test_the_ledger_lock_is_reentrant_within_a_process(tmp_path: Path) -> None:
     """``write`` calls ``query`` internally, so a non-reentrant lock would deadlock on itself."""
     store = LedgerStore(tmp_path / "reentrant.duckdb")
-    from agentoquant.enums import Stage
-    from agentoquant.ledger.schema import HumanActionPayload
-    from datetime import UTC, datetime
-
     payload = HumanActionPayload(
         decision_card_id=None,
         command="pause",

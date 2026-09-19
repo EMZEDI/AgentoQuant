@@ -16,7 +16,7 @@ from agentoquant import config_loader
 
 
 @pytest.fixture(autouse=True)
-def _never_notify(monkeypatch: pytest.MonkeyPatch) -> None:
+def _never_notify(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Force outbound notifications off for every test, whatever the test does.
 
     This exists because of a real incident: ``notifications_enabled`` used to treat an *unset*
@@ -29,6 +29,10 @@ def _never_notify(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("AGENTOQUANT_TELEGRAM", "0")
     monkeypatch.setenv("AGENTOQUANT_TELEGRAM_BOT_TOKEN", "")
     monkeypatch.setenv("AGENTOQUANT_TELEGRAM_CHAT_ID", "")
+    # The cycle log is the unattended soak's acceptance evidence. Left at its default it was shared by
+    # every process on the box, so a test run appended its own cycles to the file the checkpoint is
+    # judged on. No test may write there.
+    monkeypatch.setenv("AGENTOQUANT_CYCLE_LOG", str(tmp_path / "cycles.jsonl"))
 
 
 @pytest.fixture

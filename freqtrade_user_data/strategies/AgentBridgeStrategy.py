@@ -310,13 +310,17 @@ class AgentBridgeStrategy(IStrategy):
         side,
         **kwargs,
     ) -> float:
-        """The stake is the Risk Gate's size percent of the wallet, clamped to freqtrade's limits."""
+        """The stake is the Risk Gate's approved notional, clamped to freqtrade's own limits."""
         document = self.read_signal(now=current_time)
         if not document:
             return proposed_stake
-        size_pct = float(self.execution_of(document).get("size_pct") or 0.0)
+        execution = self.execution_of(document)
+        size_pct = float(execution.get("size_pct") or 0.0)
         if size_pct <= 0:
             return proposed_stake
+        approved = self._approved_stake(execution, max_stake)
+        if approved is not None:
+            return approved
         total = 0.0
         try:
             total = float(self.wallets.get_total_stake_amount())
@@ -363,7 +367,11 @@ class AgentBridgeStrategy(IStrategy):
         size_pct = float(execution.get("size_pct") or 0.0)
         if size_pct <= 0:
             return None
-        stake = self._stake_for(current_rate, size_pct, min_stake, max_stake)
+        stake = self._approved_stake(execution, max_stake)
+        if stake is None:
+            # No approved notional in the document: fall back to the wallet percentage. A document
+            # published before this field existed still places something rather than nothing.
+            stake = self._stake_for(current_rate, size_pct, min_stake, max_stake)
 
         if action == "add":
             floor = float(min_stake or 0.0)
@@ -437,7 +445,7 @@ class AgentBridgeStrategy(IStrategy):
             if placed >= wanted:
                 return None
             self.ladder_slices[cycle_id] = placed + 1
-            slice_stake = self._stake_for(current_rate, size_pct / wanted, min_stake, max_stake)
+            slice_stake = self._slice_stake(execution, size_pct, wanted, min_stake, max_stake)
             limit_price = self._ladder_price(execution, current_rate, placed)
             self.pending_entry_price[trade.pair] = limit_price
             self._ack(
@@ -489,7 +497,12 @@ class AgentBridgeStrategy(IStrategy):
         return stashed
 
     def _stake_for(self, current_rate, size_pct, min_stake, max_stake) -> float:
-        """Size a slice from a percent of the wallet, clamped to freqtrade's own limits."""
+        """Size a slice from a percent of the wallet, clamped to freqtrade's own limits.
+
+        Kept as the **fallback** for a document that carries no approved notional. It is not the
+        primary path: sizing from the venue's wallet re-derives a number the Risk Gate already
+        decided, from a different base.
+        """
         total = 0.0
         try:
             total = float(self.wallets.get_total_stake_amount())
@@ -503,6 +516,36 @@ class AgentBridgeStrategy(IStrategy):
         if max_stake:
             stake = min(stake, float(max_stake))
         return stake
+
+    def _approved_stake(self, execution, max_stake):
+        """The notional the Risk Gate approved, from the published document, or ``None``.
+
+        Only ever clamped **down**. The execution layer may shrink or refuse a size, never enlarge it,
+        so ``min_stake`` is deliberately not applied here: the caller refuses a below-minimum size
+        rather than lifting it to the venue's floor.
+        """
+        value = execution.get("stake_amount")
+        try:
+            stake = float(value) if value is not None else 0.0
+        except (TypeError, ValueError):
+            return None
+        if stake <= 0:
+            return None
+        if max_stake:
+            stake = min(stake, float(max_stake))
+        return stake
+
+    def _slice_stake(self, execution, size_pct, wanted, min_stake, max_stake) -> float:
+        """One ladder slice's stake: the approved *money* split evenly, not a re-derived percentage.
+
+        Splitting the money is what makes the slices sum to exactly what the gate approved. Splitting
+        the percentage instead and re-deriving each slice from the wallet is how a 3 percent card
+        placed 4.999 percent less than it was allowed to.
+        """
+        approved = self._approved_stake(execution, max_stake)
+        if approved is not None:
+            return approved / max(1, int(wanted))
+        return self._stake_for(None, size_pct / wanted, min_stake, max_stake)
 
     def custom_stoploss(
         self,
