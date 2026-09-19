@@ -46,6 +46,7 @@ from agentoquant.risk.gate import (
     RULE_POST_ONLY_REQUIRED,
     RULE_SLEEVE_CAP,
     RULE_SLEEVE_DISABLED,
+    RULE_UNRESOLVED_SEVERITY5,
     RULE_UNSUPPORTED_ACTION,
     RULE_VENUE_STATUS,
     RULE_WEEKLY_DRAWDOWN_HALT,
@@ -260,6 +261,10 @@ REJECT_CASES: dict[str, tuple[dict, dict]] = {
     RULE_UNSUPPORTED_ACTION: ({"action": "grid_trade"}, {}),
     RULE_MISSING_SIZE: ({"size_pct": None}, {}),
     RULE_INCOMPLETE_CARD: ({"coin": None}, {}),
+    RULE_UNRESOLVED_SEVERITY5: (
+        {"strongest_objection": {"severity": 5, "text": "the exchange announced a delisting"}},
+        {},
+    ),
     RULE_KILL_SWITCH_FLAT: ({}, {"halts": HaltState(flat=True)}),
     RULE_DAILY_LOSS_HALT: ({}, {"halts": HaltState(daily_halted=True)}),
     RULE_WEEKLY_DRAWDOWN_HALT: ({}, {"halts": HaltState(weekly_halted=True)}),
@@ -335,3 +340,47 @@ def test_every_shrink_rule_fires(gate, limits, rule):
     assert verdict.verdict == "shrunk", f"{rule} produced {verdict.verdict}"
     assert verdict.rule_fired == rule
     assert verdict.final_size_pct == pytest.approx(permitted)
+
+
+def test_a_severity_5_objection_blocks_the_entry_at_any_size(gate, limits):
+    """plan.md: an entry acts only while no unresolved severity-5 objection remains.
+
+    Regression for F7: the gate approved this card and fired no rule at all, so the strongest
+    thing the adversary can say about a thesis blocked nothing.
+    """
+    for size in (1.0, 5.0, 15.0):
+        card = make_card(
+            size_pct=size,
+            strongest_objection={"severity": 5, "text": "the thesis is contradicted"},
+        )
+        verdict = gate.evaluate(card, base_context(limits))
+        assert_never_enlarges(verdict)
+        assert verdict.verdict == "rejected", size
+        assert verdict.rule_fired == RULE_UNRESOLVED_SEVERITY5
+        assert verdict.final_size_pct == 0.0
+
+
+def test_objections_below_severity_5_still_approve(gate, limits):
+    """The rule is the plan's severity-5 line, not a blanket block on being doubted."""
+    for severity in (0, 1, 2, 4):
+        card = make_card(strongest_objection={"severity": severity, "text": "fee drag at Tier 1"})
+        verdict = gate.evaluate(card, base_context(limits))
+        assert_never_enlarges(verdict)
+        assert verdict.verdict == "approved", severity
+        assert verdict.rule_fired is None
+
+
+def test_an_absent_objection_is_not_an_objection(gate, limits):
+    verdict = gate.evaluate(make_card(strongest_objection=None), base_context(limits))
+    assert_never_enlarges(verdict)
+    assert verdict.verdict == "approved"
+
+
+def test_a_malformed_objection_fails_closed(gate, limits):
+    """An objection the gate cannot parse is unresolved, not absent."""
+    for objection in ({}, {"severity": None}, {"severity": "not a number"}, {"text": "no severity"}):
+        card = make_card(strongest_objection=objection)
+        verdict = gate.evaluate(card, base_context(limits))
+        assert_never_enlarges(verdict)
+        assert verdict.verdict == "rejected", objection
+        assert verdict.rule_fired == RULE_UNRESOLVED_SEVERITY5

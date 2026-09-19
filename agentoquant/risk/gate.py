@@ -104,6 +104,7 @@ from agentoquant.risk.kill_switch import HaltState
 RULE_UNSUPPORTED_ACTION = "unsupported_action"
 RULE_MISSING_SIZE = "missing_size"
 RULE_INCOMPLETE_CARD = "incomplete_card"
+RULE_UNRESOLVED_SEVERITY5 = "unresolved_severity5_objection"
 RULE_KILL_SWITCH_FLAT = "kill_switch_flat"
 RULE_DAILY_LOSS_HALT = "daily_loss_halt"
 RULE_WEEKLY_DRAWDOWN_HALT = "weekly_drawdown_halt"
@@ -132,6 +133,7 @@ REJECT_RULES: tuple[str, ...] = (
     RULE_UNSUPPORTED_ACTION,
     RULE_MISSING_SIZE,
     RULE_INCOMPLETE_CARD,
+    RULE_UNRESOLVED_SEVERITY5,
     RULE_KILL_SWITCH_FLAT,
     RULE_DAILY_LOSS_HALT,
     RULE_WEEKLY_DRAWDOWN_HALT,
@@ -365,6 +367,35 @@ def _non_negative(value: float | None) -> float:
     return max(0.0, float(value))
 
 
+#: The severity at which an adversary objection blocks a new trade outright. ``plan.md``:
+#: "act only if ... and no unresolved severity-5 objection remains", and Task 20's acceptance
+#: criterion repeats it ("no trade when EV after fees is not positive by margin or a severity-5
+#: objection is unresolved").
+UNRESOLVED_OBJECTION_SEVERITY = 5
+
+
+def objection_severity(card: DecisionCard) -> int:
+    """The card's strongest objection severity, or 0 when the card carries none.
+
+    A card whose objection is present but carries no usable ``severity`` fails closed: it is
+    reported at the blocking severity, because the gate cannot tell a broken objection from a
+    serious one, and "unresolved" is the safe reading of an objection it cannot parse.
+    """
+    objection = card.strongest_objection
+    if objection is None:
+        return 0
+    if isinstance(objection, Mapping):
+        raw = objection.get("severity")
+    else:
+        raw = getattr(objection, "severity", None)
+    if raw is None:
+        return UNRESOLVED_OBJECTION_SEVERITY
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return UNRESOLVED_OBJECTION_SEVERITY
+
+
 class RiskGate:
     """Deterministic limits. It can shrink or reject a proposal, never enlarge it.
 
@@ -453,6 +484,13 @@ class RiskGate:
             return RULE_MISSING_SIZE, False, 0.0
         if coin is None or sleeve is None:
             return RULE_INCOMPLETE_CARD, False, 0.0
+
+        if objection_severity(card) >= UNRESOLVED_OBJECTION_SEVERITY:
+            # The adversary's own strongest objection is on the card, and Phase 0 has no Judge
+            # stage to resolve it. plan.md lets an entry act only while no unresolved severity-5
+            # objection remains, so the gate refuses it here rather than trusting a stage that
+            # does not exist yet. It blocks new exposure only: a reduction is never blocked.
+            return RULE_UNRESOLVED_SEVERITY5, False, 0.0
 
         halts = context.halts
         if halts.flat:
@@ -711,10 +749,12 @@ __all__ = [
     "RiskGate",
     "SELL_ACTIONS",
     "SHRINK_RULES",
+    "UNRESOLVED_OBJECTION_SEVERITY",
     "VENUE_STATUSES",
     "VENUE_STATUS_OK",
     "VERDICT_APPROVED",
     "VERDICT_REJECTED",
     "VERDICT_SHRUNK",
+    "objection_severity",
     "ontario_net_buys_cad_12m",
 ]
