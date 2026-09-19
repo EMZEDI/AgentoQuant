@@ -155,11 +155,16 @@ STAGE_TABLES: dict[Stage, str] = {stage: stage.value for stage in Stage}
 #:
 #: ``risk_gate_verdict`` has **two** writers for one decision: the gate writes its own verdict
 #: (``risk/gate.py``) and the hourly loop writes back the verdict it was handed
-#: (``execution/paper.py``). One cycle therefore landed as two rows, so ``COUNT(*) ... GROUP BY
-#: cycle_id`` double-counted the stage and the gate stopped being idempotent as a side effect (a
-#: re-evaluation after a config reload wrote a second verdict for one decision). The natural key is
-#: ``(cycle_id, decision_card_id)``: a second write with an identical payload is a no-op that returns
-#: the first record's id, and a second write that disagrees is refused rather than silently dropped.
+#: (``execution/paper.py``). One cycle therefore landed as two identical rows, so ``COUNT(*) ...
+#: GROUP BY cycle_id`` double-counted the stage. The natural key is ``(cycle_id,
+#: decision_card_id)``: a second write whose payload is **identical** to the stored one is a no-op
+#: that returns the first record's id.
+#:
+#: The dedupe deliberately collapses identical repeats only. It cannot collapse a *conflicting*
+#: re-evaluation, because ``decision_card_id`` is not a unique key in practice: the gate falls back
+#: to ``selected_proposal_id`` when the card has not been stored yet (``gate.py``, ``_card_id``), so
+#: two different decisions can share an id. Merging those would lose a decision's verdict, which is
+#: worse than the double count this fixes.
 STAGE_NATURAL_KEYS: dict[Stage, tuple[str, ...]] = {
     Stage.RISK_GATE_VERDICT: ("cycle_id", "decision_card_id"),
 }
@@ -369,13 +374,12 @@ class LedgerStore:
         body_model: LedgerPayload,
         row: dict[str, Any],
     ) -> str | None:
-        """The existing record's id when this stage's natural key is already in the table, else ``None``.
+        """The stored record's id when an **identical** record already holds this stage's natural key.
 
-        Returns the first record's ``record_id`` when the stored payload is identical to the one
-        being written (so a second writer for one decision is a no-op rather than a second row).
-        Raises :class:`LedgerWriteError` when the table already holds a *different* payload under
-        the same key: keeping the first of two disagreeing verdicts for one card would hide a
-        re-evaluation instead of recording it, so the conflict is refused loudly.
+        Returns ``None`` when the key is absent or when the stored payload differs, in which case the
+        caller writes the new row. Identical repeats are collapsed (one decision, one verdict row);
+        differing payloads are not, because a shared key is not proof of a shared decision - see
+        :data:`STAGE_NATURAL_KEYS`.
         """
         where = " AND ".join(f'"{name}" = ?' for name in key_columns)
         stored_rows = self.query(
@@ -388,20 +392,10 @@ class LedgerStore:
             name for name, _ in TABLE_COLUMNS[stage] if name not in ENVELOPE_COLUMNS
         ]
         body = body_model.model_dump(mode="json")
-        key_values = {name: row[name] for name in key_columns}
         for stored in stored_rows:
-            conflicts = {
-                name: (stored.get(name), body.get(name))
-                for name in payload_columns
-                if stored.get(name) != body.get(name)
-            }
-            if not conflicts:
+            if all(stored.get(name) == body.get(name) for name in payload_columns):
                 return str(stored["record_id"])
-        raise LedgerWriteError(
-            f"stage {stage.value}: a record for {key_values} already exists with a different "
-            f"payload ({', '.join(sorted(conflicts))}); one decision gets one {stage.value} record, "
-            "so a re-evaluation must replace it explicitly rather than add a second row"
-        )
+        return None
 
     # -- read --------------------------------------------------------------------------------
 

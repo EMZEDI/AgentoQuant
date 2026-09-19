@@ -21,7 +21,7 @@ from datetime import UTC, datetime, timedelta
 
 from agentoquant.enums import Action, ConfidenceBand, Sleeve, Stage
 from agentoquant.ledger.schema import DecisionCard, RiskGateVerdict
-from agentoquant.ledger.store import LedgerStore, LedgerWriteError
+from agentoquant.ledger.store import LedgerStore
 from agentoquant.risk import MarketContext, PortfolioContext, RiskGate
 
 CYCLE = "2026-09-19T05Z-0001"
@@ -184,42 +184,42 @@ def test_re_evaluating_one_card_writes_one_row(tmp_path) -> None:
     assert len(rows) == 1, f"a re-evaluation added a row: {rows}"
 
 
-def test_a_second_verdict_that_disagrees_is_refused(tmp_path) -> None:
-    """A different verdict for the same card is a conflict, not a second row."""
+def test_identical_repeats_are_collapsed_but_conflicting_ones_are_not(tmp_path) -> None:
+    """The dedupe's boundary: a repeat of the same verdict is a no-op, a different one is a row.
+
+    The key is ``(cycle_id, decision_card_id)``, and that id is not unique in practice - the gate
+    falls back to ``selected_proposal_id`` when the card is not stored yet - so a conflicting payload
+    under the same key cannot be assumed to be the same decision. It is written, not merged.
+    """
     ledger = LedgerStore(tmp_path / "ledger.duckdb")
     card_id = write_card(ledger)
+    approved = RiskGateVerdict(
+        decision_card_id=card_id,
+        verdict="approved",
+        rule_fired=None,
+        original_size_pct=3.0,
+        final_size_pct=3.0,
+        funding_floor_breach=False,
+    )
+    first = ledger.write(Stage.RISK_GATE_VERDICT, CYCLE, approved, producer_role="risk_gate")
+    repeat = ledger.write(Stage.RISK_GATE_VERDICT, CYCLE, approved, producer_role="risk_gate")
+    assert repeat == first, "an identical repeat wrote a second row"
+    assert len(verdict_rows(ledger)) == 1
+
     ledger.write(
         Stage.RISK_GATE_VERDICT,
         CYCLE,
         RiskGateVerdict(
             decision_card_id=card_id,
-            verdict="approved",
-            rule_fired=None,
+            verdict="rejected",
+            rule_fired="daily_turnover_cap",
             original_size_pct=3.0,
-            final_size_pct=3.0,
+            final_size_pct=0.0,
             funding_floor_breach=False,
         ),
         producer_role="risk_gate",
     )
-    try:
-        ledger.write(
-            Stage.RISK_GATE_VERDICT,
-            CYCLE,
-            RiskGateVerdict(
-                decision_card_id=card_id,
-                verdict="rejected",
-                rule_fired="daily_turnover_cap",
-                original_size_pct=3.0,
-                final_size_pct=0.0,
-                funding_floor_breach=False,
-            ),
-            producer_role="risk_gate",
-        )
-    except LedgerWriteError as exc:
-        assert "different payload" in str(exc)
-    else:  # pragma: no cover - the assertion below is the point
-        raise AssertionError("a disagreeing second verdict was accepted")
-    assert len(verdict_rows(ledger)) == 1
+    assert len(verdict_rows(ledger)) == 2, "a conflicting verdict was merged away"
 
 
 # ----------------------------------------------------------------------------------------------
