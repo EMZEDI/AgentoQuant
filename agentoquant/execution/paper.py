@@ -44,6 +44,7 @@ from agentoquant.execution.order_manager import (
 )
 from agentoquant.execution.signal_store import SignalStore
 from agentoquant.execution.telegram_bot import TelegramNotifier
+from agentoquant.ledger.outcomes import record_due_outcomes
 from agentoquant.ledger.store import LedgerStore
 from agentoquant.risk import MarketContext, PortfolioContext, PositionContext, RiskGate
 from agentoquant.risk.kill_switch import HaltState, KillSwitch, build_kill_switch
@@ -135,6 +136,9 @@ def placeholder_context(
             volume_24h_usd=PLACEHOLDER_MARKET_VOLUME_USD,
             spread_pct=PLACEHOLDER_MARKET_SPREAD_PCT,
             tradable=True,
+            # The snapshot's own timestamp, so the gate's staleness rule has something to age. Left
+            # unset the rule could never fire, which is what adversary finding F11 was about.
+            as_of=now,
         )
         for name in {*placeholder_universe(), coin}
         if name
@@ -163,9 +167,19 @@ def placeholder_context(
         order_purpose="entry",
         stop_on_exchange=True,
         stop_price=round(price * (1 - PLACEHOLDER_STOP_PCT / 100.0), 8) if price else None,
+        # Declared here rather than left to the gate's config default, so the limit travels with the
+        # data it describes: two cadences, the same margin the gate assumes.
+        market_data_max_age_s=market_data_max_age_s(),
         halts=halts if halts is not None else HaltState(),
         now=now,
     )
+
+
+def market_data_max_age_s() -> float:
+    """How old a snapshot may be before the gate calls it stale: two cadences, in seconds."""
+    from agentoquant import scheduler
+
+    return float(scheduler.cadence_minutes() * 60 * 2)
 
 
 def cycle_cost_usd(ledger: LedgerStore, cycle_id: str) -> float:
@@ -349,6 +363,18 @@ def run_cycle(
         ],
         "status": "ok",
     }
+
+    # The outcome stage's writer. It was written for Task 22's horizons and nothing called it, so no
+    # +1h/+4h/+24h record could ever exist (adversary finding F3). It is idempotent and only writes
+    # horizons that have actually elapsed, so calling it every cycle backfills after downtime and
+    # writes nothing on the cycles where nothing is due. A fault here is recorded against the cycle
+    # rather than raised: the ledger is the source of truth and a cycle's own record must survive.
+    try:
+        summary["outcomes_written"] = int(record_due_outcomes(ledger, as_of=moment).get("written_count", 0))
+    except Exception as exc:  # pragma: no cover - exercised by injecting a broken ledger
+        summary["outcomes_written"] = 0
+        summary["outcomes_error"] = f"{type(exc).__name__}: {exc}"[:200]
+
     append_cycle_log(summary, path=log_path)
 
     if notify and notifier is not None:

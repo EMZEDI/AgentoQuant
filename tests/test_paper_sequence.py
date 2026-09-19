@@ -71,7 +71,7 @@ def test_two_consecutive_ticks_run_different_actions_end_to_end(tmp_path, monkey
             hours=1,
             placeholder=True,
             sleep=False,
-            interval_s=0.0,
+            interval_s=0.0, ack_wait_s=0.1,
             ledger=ledger,
             store=store,
             transport=NullTransport(),

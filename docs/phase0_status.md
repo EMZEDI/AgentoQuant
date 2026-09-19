@@ -161,12 +161,41 @@ work.
 
 ### Still open after this round
 
-- **Caller wiring for F11 and F3**, both one line in `agentoquant/execution/paper.py`, which the
-  execution agent owns: pass `as_of=now` into the placeholder market context, and call
-  `record_due_outcomes(ledger, as_of=moment)` after orders are submitted. Until then the gate can
-  detect staleness but the Phase 0 loop cannot make it stale, and the outcome recorder exists but
-  nothing calls it.
-- **F1, F4, F5, F10, F13** are fixed on the execution branch and pending merge review.
+- **None of the round-1 findings remain open** except the parts that genuinely need later phases:
+  F9 stays inert on live data until F1's write-back is exercised by a real fill, and F5 (the stop
+  level still publishes `null`) and F10 (the bridge sizes from the dry-run wallet while the gate sizes
+  from CAD book value) are recorded as gaps in `docs/task06_execution_report.md`.
+
+### Caller wiring, done by the phase agent
+
+Both were one line in `paper.py`, which had a single owner while the fix agents ran:
+
+- **F11** — the loop now puts the snapshot's own timestamp on every `MarketContext` and declares the
+  staleness limit itself (two cadences) instead of inheriting the gate's config default. Before this,
+  the gate could detect staleness but the loop could never make a snapshot stale.
+- **F3** — the cycle now calls `record_due_outcomes(ledger, as_of=moment)` after the orders are
+  submitted and before the cycle log is appended, and records `outcomes_written` on the summary. It
+  is idempotent, so it backfills after downtime and writes nothing when nothing is due. A fault is
+  recorded against the cycle rather than raised, because the ledger is the source of truth and a
+  cycle's own record must survive.
+- Covered by `tests/test_paper_wiring.py` (six tests, driving the real loop).
+
+### Latent inconsistency found while wiring F3
+
+**The ledger stamps its own rows with the real clock, while the loop's decision logic uses its
+injected `now`.** They agree in production, where `now` defaults to the real clock, but a cycle run
+with an injected future moment writes a card whose recorded `ts` is in the past relative to that
+moment, so the card looks overdue the instant it is created and the recorder writes its +1h outcome
+immediately. Harmless today and it does not affect the soak; it would bite a backfill or a replay,
+which is exactly what Phase 1 introduces. Recorded for round 2.
+
+### Credential hygiene
+
+The execution agent disclosed that a `cat` of its scratch venue override printed the local dry-run
+API password into its transcript. Checked: the value appears in no repository file, no commit, and
+not even in the transcript (Hermes' log redaction had caught it). Rotated anyway — new password and
+JWT key in `~/.config/agentoquant/`, both mode 600, venue restarted and answering on the new
+credential.
 
 ## Next
 
