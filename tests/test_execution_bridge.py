@@ -1556,6 +1556,35 @@ def test_the_bridge_refuses_a_trim_it_cannot_size(tmp_path: Path) -> None:
     assert ack is not None and ack["result"]["action"] == "trim_refused"
 
 
+def test_the_bridge_prices_each_ladder_slice_at_its_own_offset() -> None:
+    """freqtrade takes no price from adjust_trade_position, so the bridge stashes one per slice."""
+    module = _strategy_module()
+    document = {"ladder_offsets_pct": list(LADDER_OFFSETS_PCT)}
+    prices = [
+        module.AgentBridgeStrategy._ladder_price(document, 100.0, index) for index in range(3)
+    ]
+    assert prices == [99.9, 99.75, 99.6]
+    assert len(set(prices)) == 3
+    assert prices == sorted(prices, reverse=True)
+
+
+def test_the_bridge_falls_back_to_its_own_offsets_when_the_document_carries_none() -> None:
+    module = _strategy_module()
+    prices = [module.AgentBridgeStrategy._ladder_price({}, 100.0, index) for index in range(4)]
+    assert prices[3] == prices[2], "an index past the table reuses the deepest offset"
+
+
+def test_custom_entry_price_returns_only_a_price_the_slice_hook_stashed() -> None:
+    module = _strategy_module()
+    strategy = module.AgentBridgeStrategy.__new__(module.AgentBridgeStrategy)
+    strategy.pending_entry_price = {}
+    # Nothing stashed: freqtrade's own pricing stands, which is what the force entry needs.
+    assert strategy.custom_entry_price("BTC/USD", None, HOUR, 100.0, None, "long") is None
+    strategy.pending_entry_price["BTC/USD"] = 99.9
+    assert strategy.custom_entry_price("BTC/USD", None, HOUR, 100.0, None, "long") == 99.9
+    assert strategy.custom_entry_price("BTC/USD", None, HOUR, 100.0, None, "long") is None
+
+
 def test_the_placeholder_universe_comes_from_the_sleeve_config() -> None:
     universe = placeholder_universe()
     assert universe and "BTC" in universe

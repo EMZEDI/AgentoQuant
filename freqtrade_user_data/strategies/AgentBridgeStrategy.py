@@ -55,6 +55,10 @@ SIGNAL_MAX_AGE_SECONDS = 75 * 60
 #: Environment override for the signal directory, shared with the pipeline.
 SIGNAL_DIR_ENV = "AGENTOQUANT_SIGNAL_DIR"
 
+#: Ladder offsets below the reference price, as published by the pipeline. The fallback keeps the
+#: bridge self-contained when an older document carries none.
+DEFAULT_LADDER_OFFSETS_PCT = (0.10, 0.25, 0.40)
+
 
 def roi_step(ladder: dict, trade, current_time) -> float | None:
     """The minimal-ROI ratio that applies to ``trade`` now, or ``None`` when the ladder is empty.
@@ -161,6 +165,10 @@ class AgentBridgeStrategy(IStrategy):
         self.ladder_slices = {}
         self.last_stop = {}
         self.event_entries = {}
+        #: The limit price the next order for a pair should use, set by the hook that decided the
+        #: slice and consumed by ``custom_entry_price``. freqtrade does not take a price from
+        #: ``adjust_trade_position``, so without this every slice of a ladder fills at one price.
+        self.pending_entry_price = {}
         logger.info("AgentBridgeStrategy: reading signals from %s", self.signal_dir)
 
     # -- reading the published document ----------------------------------------------------------
@@ -374,6 +382,7 @@ class AgentBridgeStrategy(IStrategy):
                     },
                 )
                 return None
+            self.pending_entry_price[trade.pair] = self._ladder_price(execution, current_rate, 0)
             self._ack(document, {"action": "add", "pair": trade.pair, "stake": stake})
             return stake, "dca_add"
 
@@ -429,6 +438,8 @@ class AgentBridgeStrategy(IStrategy):
                 return None
             self.ladder_slices[cycle_id] = placed + 1
             slice_stake = self._stake_for(current_rate, size_pct / wanted, min_stake, max_stake)
+            limit_price = self._ladder_price(execution, current_rate, placed)
+            self.pending_entry_price[trade.pair] = limit_price
             self._ack(
                 document,
                 {
@@ -437,11 +448,45 @@ class AgentBridgeStrategy(IStrategy):
                     "slice": placed + 1,
                     "of": wanted,
                     "stake": slice_stake,
+                    "limit_price": limit_price,
                 },
             )
             return slice_stake, f"ladder_slice_{placed + 1}"
 
         return None
+
+    @staticmethod
+    def _ladder_price(execution: dict, current_rate, index: int) -> float:
+        """This slice's limit price: its own offset below the rate the venue is trading at.
+
+        The offsets come from the published document, so the pipeline and the bridge cannot disagree
+        about what a ladder is. Slice N sits below slice N-1, which is what makes the fills distinct
+        instead of three slices at one price.
+        """
+        offsets = execution.get("ladder_offsets_pct") or list(DEFAULT_LADDER_OFFSETS_PCT)
+        try:
+            chosen = float(offsets[min(int(index), len(offsets) - 1)])
+        except (TypeError, ValueError, IndexError):
+            chosen = float(DEFAULT_LADDER_OFFSETS_PCT[0])
+        return round(float(current_rate) * (1.0 - chosen / 100.0), 8)
+
+    def custom_entry_price(
+        self,
+        pair,
+        trade,
+        current_time,
+        proposed_rate,
+        entry_tag,
+        side,
+        **kwargs,
+    ):
+        """The limit price for a ladder slice, when the slice hook decided one.
+
+        Returns ``None`` (freqtrade's own pricing stands) for every entry that is not a slice this
+        strategy sized: the pipeline's force entry carries its own price.
+        """
+        stashed = self.pending_entry_price.pop(pair, None)
+        return stashed
 
     def _stake_for(self, current_rate, size_pct, min_stake, max_stake) -> float:
         """Size a slice from a percent of the wallet, clamped to freqtrade's own limits."""
