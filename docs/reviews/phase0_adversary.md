@@ -875,12 +875,16 @@ Matches, verified rather than assumed:
   `MarketBrief`/`DecisionCard` shapes. I found no renamed, added or dropped field.
 - **The ledger really does create fourteen tables** (`tests/test_ledger_roundtrip.py:479`,
   `len(tables) == 14`), and the soak ledger shows all fourteen present.
-- **The test gate is green**: `227 passed, 1 skipped in 76.18s`.
+- **The test gate is green**: `234 passed, 1 skipped in 85.16s` after merging `main` at `5cc0659`
+  (it was `227 passed, 1 skipped in 76.18s` at `bdd47bd`).
+- **The ccxt fee gap named in `docs/phase0_status.md` is partly closed**: `5cc0659` adds a `fee`
+  key and a fail-closed floor on it. It is closed in one direction only — see F18.
 
 Deviations, in ascending order of significance:
 
-1. `docs/phase0_status.md:15` says "22 rules" where the module exposes 23 (F12), and line 18 says
-   "197 tests pass, 1 skipped" where the tree now runs 227. Both are report drift, not code drift.
+1. `docs/phase0_status.md:15` still says "22 rules" where the module exposes 23 (F12). The "197
+   tests" line was corrected to 227 by `5cc0659`; the tree now runs 234 after that commit's own test
+   file landed. Report drift, not code drift.
 2. `agentoquant/data/early_signals/runner.py` and `agentoquant/execution/paper.py` are additions §1
   does not list. Both are load-bearing (the soak's timer calls `paper`), and both were reported in
    the task reports, so they read as the "smallest deviation, stated" that §0 permits rather than
@@ -896,6 +900,62 @@ behaviour (F1-F16), not in shape.
 **Suggested fix.** None for the tree or the enums. Fix the two stale numbers in
 `docs/phase0_status.md`, and decide the MCP naming question explicitly (either adopt the plan's
 hyphenated names or record the underscore mapping as a stated deviation in the addendum).
+
+## F18 — the new dry-run fee floor is the maker rate, so every stop and emergency exit is simulated 0.4 percent too cheap
+
+**Severity: medium** (the fee gap named in `docs/phase0_status.md` was closed in one direction and
+re-opened in the other, and the new test asserts the reopened version is correct)
+
+**Files/lines**
+- `freqtrade_user_data/config.json:7` — `"fee": 0.004`, added by `5cc0659`.
+- `agentoquant/execution/freqtrade_strategy.py:126-151` — `_assert_venue_fee_not_flattering`, which
+  floors the fee at the **maker** rate only.
+- `freqtrade_user_data/config.json:53,56` — `"emergency_exit": "market"` and `"stoploss": "market"`.
+- `config/fee_tiers.yaml` — Tier 1 `maker_pct: 0.40`, `taker_pct: 0.80`; note: "Market orders are
+  reserved for stops and emergency exits, where the taker fee is the price of getting out."
+- `tests/test_venue_fee.py:77-81` — `test_a_pessimistic_fee_is_accepted`, whose docstring says
+  "Charging the taker rate for everything is allowed: it can only understate the P&L".
+
+**What I did.** Read the fee fix that landed on `main` after my first pass and compared the rate it
+enforces against the order types the same config declares.
+
+**What I observed.**
+
+```
+$ python3 -c "import json;c=json.load(open('freqtrade_user_data/config.json'));print(c['fee'], c['order_types']['stoploss'], c['order_types']['emergency_exit'])"
+0.004 market market
+```
+```
+$ sed -n '41,43p' tests/test_venue_fee.py
+def current_maker_rate() -> float:
+    tiers = load_fee_tiers()
+    return float(tiers.tier(tiers.current_tier).maker_pct) / 100.0
+```
+```
+$ sed -n '77,81p' tests/test_venue_fee.py
+def test_a_pessimistic_fee_is_accepted(tmp_path: Path) -> None:
+    """Charging the taker rate for everything is allowed: it can only understate the P&L."""
+    tiers = load_fee_tiers()
+    config["fee"] = float(tiers.tier(tiers.current_tier).taker_pct) / 100.0
+```
+
+**Why it matters.** freqtrade's dry-run `fee` is one flat rate applied to every simulated fill, and
+the assertion added in `5cc0659` requires only that it be at or above the **maker** rate. The shipped
+value is exactly the maker rate (0.4 percent), while the same config declares stops and emergency
+exits as **market** orders, which pay the Tier 1 **taker** rate of 0.8 percent. So the venue now
+under-charges every stop fill by half, and stops are the exit path the plan leans on. The prior gap
+was "fees come from ccxt at 0.26 percent"; the new state is "fees are 0.4 percent, including for the
+0.8 percent orders". `tests/test_venue_fee.py` now asserts the shipped config is acceptable, which
+makes the optimism structural rather than accidental. This is the same class of defect the commit set
+out to remove, and it contradicts `.hermes.md`'s fee line ("Tier 1 (maker 0.4000%, ... taker 0.80%)").
+
+**Suggested fix.** Either set `fee` to the taker rate (0.008) so every simulated fill is pessimistic,
+as `test_a_pessimistic_fee_is_accepted` already anticipates, or accept that one flat fee cannot
+express a two-rate schedule and correct for the taker orders explicitly when the P&L is reported.
+Whichever is chosen, extend `_assert_venue_fee_not_flattering` to reason about the taker rate whenever
+`order_types` declares a market order, and add an assertion for the stop path specifically.
+
+---
 
 ## The safety invariant: can anything here place, amend or cancel a real order, or move funds?
 
@@ -990,7 +1050,7 @@ Clause by clause:
 | Stops on the exchange | **Verified** | The soak's sqlite shows an open sell stop at 76,946.8 with `stoploss_on_exchange: true`, and `docs/phase0_status.md` reproduces the order table. `stoploss_on_exchange` is set in both the strategy and `config.json` |
 | Every cycle in the ledger | **Partially** | Nine `decision_card` rows and nine `execution` rows, one per cycle. But two `risk_gate_verdict` rows per cycle (F2), no `outcome` row ever (F3), and no `execution` row at all for the hook-only paths (F5) |
 | Every token in the ledger | **Not verified** | `human_action`, `llm_call`, `funding_request`, `raw_snapshot`, `early_signal`, `verified_event`, `model_output`, `analyst_report`, `proposal_sample`, `adversary_objection` and `outcome` all have zero rows in the soak ledger. Some of that is expected in Phase 0 (no LLM calls, no cascade), and `llm_call: 0` is honestly declared. The `outcome` stage is not expected to be empty — it has no writer at all |
-| Cost per cycle measured | **Not satisfied** | The only per-cycle cost row is `fee_paid=None` on every execution record, for cycles where the venue filled (F1). `cost_usd` in the cycle summary is `0.0` because Phase 0 makes no LLM call — that part is honest. The *execution* cost the clause needs is absent and, worse, recorded as a non-fill |
+| Cost per cycle measured | **Not satisfied** | The only per-cycle cost row is `fee_paid=None` on every execution record, for cycles where the venue filled (F1). `cost_usd` in the cycle summary is `0.0` because Phase 0 makes no LLM call — that part is honest. The *execution* cost the clause needs is absent and, worse, recorded as a non-fill. The fee the venue would charge is now stated rather than inherited from ccxt, but it is the maker rate applied to market-order stops (F18) |
 | No API quota breaches | **Partially verified** | `quota.breaches()` was empty for the ingest path, and `QuotaManager.acquire` genuinely refuses before the call. But seven sources' quotas are not enforced by that manager at all (F14), and the accounting is per process so a budget can be spent twice (F15) |
 | The Risk Gate blocks every adversarial proposal in its test set | **Verified for the gate's own test set, and not for the set that matters** | All seven cases Task 5 names reject or shrink, and I could not enlarge a proposal (see the battery). But a severity-5 objection is approved (F7), seven of twelve actions never reach a rule (F8), and the Ontario cap is inert on real data (F9) |
 
@@ -1039,6 +1099,7 @@ number wrong in the same direction.
 | F14 | Early-signal layer bypasses the quota manager | **medium** |
 | F15 | Quota accounting is per process | **medium** |
 | F16 | Two tautological tests; ledger completeness test blind to F3 | **medium** |
+| F18 | New dry-run fee floor is the maker rate; stops simulated 0.4% too cheap | **medium** |
 | F12 | Dead config keys in `risk_limits.yaml`; "22 rules" vs 23 | **low** |
 | F17 | MCP name spelling deviation; two stale numbers in the status doc | **low** |
 
