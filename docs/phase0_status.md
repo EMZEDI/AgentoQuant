@@ -15,7 +15,7 @@ where something could not be verified it says so instead of guessing.
 | 5 | Deterministic Risk Gate (27 rules), kill switch, funding floor | 18/18 acceptance checks against a real ledger; 36 adversarial tests, 27 cases (one per rule) |
 | 6 | Paper harness, freqtrade dry-run bridge, order manager for the twelve-action vocabulary, signal store, Telegram notifier, scheduler, systemd units | 24 consecutive cycles, 0 failures, three real dry-run trades each tagged with its cycle id |
 
-Gate on `main`: **461 tests pass, 1 skipped (opt-in live cost check), ruff clean.**
+Gate on `main`: **565 tests pass, 1 skipped (opt-in live cost check), ruff clean.**
 
 ## The loop is running unattended
 
