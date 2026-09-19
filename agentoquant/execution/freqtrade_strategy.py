@@ -133,6 +133,12 @@ def _assert_venue_fee_not_flattering(config: dict[str, Any]) -> None:
     while the account sits on Tier 1 at 0.40% maker. A soak on the cheaper number would report a
     P&L the account can never earn, so the config must state the fee and it must not sit below the
     tier the book is actually on. Being pessimistic is allowed; being optimistic is not.
+
+    One flat rate cannot express a two-rate schedule, so the maker floor is also charged to the
+    market-order stops the same config declares - an optimism this function accepts deliberately,
+    because the maker round trip is the number the plan's decision rule is written against, and
+    corrects on the ledger side where each fill is priced at its own order type's rate. The size of
+    the exposure is exposed by :func:`venue_fee_optimism` and pinned by a test rather than hidden.
     """
     tiers = load_fee_tiers()
     tier = tiers.tier(tiers.current_tier)
@@ -150,6 +156,32 @@ def _assert_venue_fee_not_flattering(config: dict[str, Any]) -> None:
             f"dry-run fee {float(fee):.4f} is below the {tiers.current_tier} maker rate "
             f"{floor:.4f}: the venue would flatter every fill"
         )
+
+
+#: Order types whose fills pay the taker rate rather than the maker rate.
+TAKER_ORDER_TYPES: tuple[str, ...] = ("stoploss", "emergency_exit")
+
+
+def venue_fee_optimism(config: dict[str, Any]) -> float:
+    """How much the venue under-charges a taker fill, as a rate (``0.0`` when there is none).
+
+    freqtrade's dry-run ``fee`` is one flat rate, so a stop - which the config declares as a market
+    order and which really pays the taker rate - is simulated at whatever that flat rate is. Stops
+    are the exit path the plan leans on, so the exposure is reported rather than assumed away: this
+    is the number the ledger's per-order-type fee accounting exists to cancel out.
+    """
+    tiers = load_fee_tiers()
+    tier = tiers.tier(tiers.current_tier)
+    taker = float(tier.taker_pct) / 100.0
+
+    order_types = config.get("order_types") or {}
+    if not any(order_types.get(name) == "market" for name in TAKER_ORDER_TYPES):
+        return 0.0
+
+    fee = config.get("fee")
+    if fee is None:
+        return taker
+    return max(0.0, taker - float(fee))
 
 
 def check_strategy_hygiene(source: str | None = None) -> list[str]:
