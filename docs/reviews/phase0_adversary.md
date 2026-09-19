@@ -635,6 +635,157 @@ phase report's "22 rules" is wrong: the module exposes 23.
 gate read them and remove the duplicate from `sleeves.yaml` — one source, named once). Correct
 `docs/phase0_status.md` to 23 rules, or state which rule is excluded from the count.
 
+
+---
+
+## The safety invariant: can anything here place, amend or cancel a real order, or move funds?
+
+**Answer: no, and I could not construct a path that does.** This is the strongest part of Phase 0 and
+it is worth stating exactly why, because the reasoning is structural rather than documentary.
+
+**What I did.** Enumerated every code path that can reach Kraken or freqtrade: the connector, the
+early-signal listener, the dry-run transport, the bridge strategy, and the CLI/MCP surface. Then
+grepped the whole tree for every Kraken write endpoint name and every fund-movement verb.
+
+**What I observed.**
+
+```
+$ grep -rn "AddOrder|CancelOrder|AmendOrder|Withdraw|add_order|withdraw" --include=*.py --include=*.yaml --include=*.json . | grep -v .venv | grep -v ^./tests/
+./config/sources.yaml:32:      Read-only private endpoints only; the agent never calls AddOrder/CancelOrder/AmendOrder/Withdraw*.
+./agentoquant/data/connectors/kraken.py:62:    "AddOrder",
+./agentoquant/data/connectors/kraken.py:63:    "CancelOrder",
+./agentoquant/data/connectors/kraken.py:65:    "AmendOrder",
+./agentoquant/data/connectors/kraken.py:67:    "Withdraw",
+```
+```
+agentoquant/data/connectors/kraken.py:47:READ_ONLY_PRIVATE_PATHS: frozenset[str] = frozenset(
+        "/0/private/Balance", "/0/private/TradeBalance", "/0/private/TradeVolume",
+        "/0/private/OpenOrders", "/0/private/ClosedOrders", "/0/private/Ledgers",
+        "/0/private/DepositMethods", "/0/private/DepositStatus")
+```
+```
+$ grep -rn "api.kraken.com" --include=*.py agentoquant/
+agentoquant/data/connectors/kraken.py:43:BASE_URL = "https://api.kraken.com"
+agentoquant/data/early_signals/kraken_listings.py:46:BASE_URL = "https://api.kraken.com"
+```
+
+**Why it holds.** Four independent layers, all of them code rather than comments:
+
+1. **The Kraken connector is structurally read-only.** `_guard` (`kraken.py:101-113`) runs before
+   every private request is signed and refuses anything not on an eight-entry read-only allow-list,
+   with a second deny-list (`FORBIDDEN_PATH_FRAGMENTS`, lines 61-74) on top. The only Kraken private
+   paths that exist in the tree are those eight. The only other Kraken caller is the early-signal
+   listener, and it touches `/0/public/AssetPairs` and the blog RSS only — both public, both in
+   `early_signals/kraken_listings.py:47`.
+2. **There is exactly one freqtrade client constructor** in the package
+   (`order_manager.py:363-369`), and it runs `assert_dry_run_config` first
+   (`order_manager.py:356-361`), returning `NullTransport` when the config is not dry-run
+   (`freqtrade_strategy.py:104-124`: `dry_run is True`, `exchange.name == "kraken"`, empty
+   `exchange.key`/`exchange.secret`). The venue unit also passes `--dry-run` explicitly
+   (`deploy/agentoquant-freqtrade.service`), so the flag is belt and braces.
+3. **Funds are untouched by construction.** There is no withdrawal, transfer or deposit-address code
+   anywhere. `funding_floor.py` writes one ledger row and renders one Telegram card
+   (`funding_floor.py:148-150`, `153-168`) and imports no exchange client at all; the run confirms
+   `"moved_funds": False` is reported rather than performed (`funding_floor.py:249`).
+4. **Every submission is a dry-run submission.** `orders.execute` only ever calls methods on the
+   `_FreqtradeDryRunTransport`, which is built over a client pointed at `http://127.0.0.1:8080`.
+
+**Two caveats, stated as caveats rather than as violations.**
+
+- `assert_dry_run_config` reads `freqtrade_user_data/config.json`, but the running venue merges a
+  second config file the guard never inspects (`deploy/agentoquant-freqtrade.service` passes
+  `--config %h/.config/agentoquant/freqtrade_local.json`). That file currently only sets
+  `api_server`, so nothing is wrong today; the guard is simply not the whole story. **Low.**
+- `config/settings.yaml`'s `venue.mode: paper` is **read only for a report note**
+  (`ingest.py:617`). Paper-only is enforced at the venue boundary, not by that flag. **Low**, but the
+  flag should not be mistaken for a control.
+
+**Is paper-only enforced or only documented?** Enforced, at the venue boundary and at the connector
+boundary. The settings flag is documentation.
+
+**Can the Risk Gate be bypassed?** For the five increasing actions, no: `evaluate` is the only
+producer of a verdict, `OrderManager.plan_for_action` refuses to build intents from a rejected
+verdict (`order_manager.py:611-622`), the size comes only from `verdict.final_size_pct`
+(`order_manager.py:623`), the published document carries the same value
+(`signal_store.py:120`), and the bridge re-checks `approved` before acting
+(`AgentBridgeStrategy.py:241-246`, `320-325`). There is no second path to a size. The qualifications
+are F8 (seven actions never reach the rules at all) and F10 (the venue re-derives the stake from the
+wallet, so the gate's number is advisory at the last step).
+
+---
+
+## Checkpoint answer
+
+The checkpoint: *"a trivial strategy runs the full hourly loop in paper mode with post-only orders and
+stops on the exchange, every cycle and every token in the ledger, cost per cycle measured, no API
+quota breaches, and the Risk Gate blocks every adversarial proposal in its test set."*
+
+**Does Phase 0 satisfy it? Partly, and not as stated. I would not sign it off.**
+
+Clause by clause:
+
+| Clause | Verdict | Basis |
+|---|---|---|
+| A trivial strategy runs the full hourly loop in paper mode | **Partially verified** | Nine unattended cycles ran, exit 0, `ack: acked`, one JSON line each (F6). But all nine were the same action, and the loop's gate context is a hard-coded placeholder (`paper.py:54-67, 111-161`) that can only produce `approved` |
+| Post-only orders | **Not verified as claimed** | `post_only` is a field on `OrderIntent` and in the published document, and it is never sent to the venue. `forceenter` has no post-only parameter (`freqtrade_client` signature: `pair, side, price, order_type, stake_amount, leverage, enter_tag`), and `config.json`'s `order_types.force_entry` is `"limit"`. The limit sits below the market, which is post-only *in effect*, but nothing enforces maker-only, and rungs 2 and 3 of every ladder are priced by freqtrade from its own order book, not from the plan (F5) |
+| Stops on the exchange | **Verified** | The soak's sqlite shows an open sell stop at 76,946.8 with `stoploss_on_exchange: true`, and `docs/phase0_status.md` reproduces the order table. `stoploss_on_exchange` is set in both the strategy and `config.json` |
+| Every cycle in the ledger | **Partially** | Nine `decision_card` rows and nine `execution` rows, one per cycle. But two `risk_gate_verdict` rows per cycle (F2), no `outcome` row ever (F3), and no `execution` row at all for the hook-only paths (F5) |
+| Every token in the ledger | **Not verified** | `human_action`, `llm_call`, `funding_request`, `raw_snapshot`, `early_signal`, `verified_event`, `model_output`, `analyst_report`, `proposal_sample`, `adversary_objection` and `outcome` all have zero rows in the soak ledger. Some of that is expected in Phase 0 (no LLM calls, no cascade), and `llm_call: 0` is honestly declared. The `outcome` stage is not expected to be empty — it has no writer at all |
+| Cost per cycle measured | **Not satisfied** | The only per-cycle cost row is `fee_paid=None` on every execution record, for cycles where the venue filled (F1). `cost_usd` in the cycle summary is `0.0` because Phase 0 makes no LLM call — that part is honest. The *execution* cost the clause needs is absent and, worse, recorded as a non-fill |
+| No API quota breaches | **Partially verified** | `quota.breaches()` was empty for the ingest path, and `QuotaManager.acquire` genuinely refuses before the call. But seven sources' quotas are not enforced by that manager at all (F14), and the accounting is per process so a budget can be spent twice (F15) |
+| The Risk Gate blocks every adversarial proposal in its test set | **Verified for the gate's own test set, and not for the set that matters** | All seven cases Task 5 names reject or shrink, and I could not enlarge a proposal (see the battery). But a severity-5 objection is approved (F7), seven of twelve actions never reach a rule (F8), and the Ontario cap is inert on real data (F9) |
+
+**What I could not verify, and why.** I could not observe a live reject or shrink in the running
+system: the soak's gate context is a placeholder that hard-codes a liquid market, a healthy venue and
+a stop on the exchange (`paper.py:126-161`), and all nine cycles came back `approved` with
+`rule_fired: null`. Every reject and shrink result in this report comes from a scratch-ledger battery,
+not from a live cycle. I could not verify the "no quota breaches" claim for the early-signal path,
+because that path does not report to the quota manager. I could not verify a fill being written to the
+ledger, because it never is. And I did not touch the live venue's state, so the execution-bridge
+findings are proven by signature binding and by the soak's own sqlite, not by placing a test order.
+
+**The single most dangerous thing I found.** The kill switch is not on any production path, and
+`/flat` closes nothing (F13). `KillSwitch` is constructed only in an acceptance script;
+`close_all_orders` has no caller; the loop never passes a `HaltState` to the gate. Task 5's acceptance
+criterion says the kill switch "closes positions and blocks new entries", `docs/phase0_status.md`
+records "18/18 acceptance checks" for Task 5, and the tests pass — while a `/flat` would set a flag,
+write a `human_action` row and report `positions_to_close`, leaving every position open. A safety
+control that reports success and does nothing is the worst failure mode available, because the
+operator's next action is predicated on it having worked. Fix this before anything else in this
+report, and before the soak is allowed to count as evidence of anything.
+
+**Runner-up, and the reason the checkpoint's "cost per cycle" clause cannot be signed:** the execution
+ledger records filled orders as `unfilled_timeout` with null fills and fees (F1), which also makes the
+Ontario net-buy cap permanently inert (F9) and makes every downstream cost, hit-rate and compliance
+number wrong in the same direction.
+
+---
+
+## Ranked summary
+
+| # | Finding | Severity |
+|---|---|---|
+| F13 | Kill switch unwired; `/flat` closes nothing; no `HaltState` reaches the gate | **blocker** |
+| F1 | `execution` rows report fills as `unfilled_timeout` with null fill/fee | **high** |
+| F9 | Ontario net-buy cap permanently inert because of F1 | **high** |
+| F2 | Two `risk_gate_verdict` rows per cycle | **high** |
+| F3 | `outcome` stage has no writer; no +1h/+4h/+24h records | **high** |
+| F4 | `exit` and `cancel_order` throw `TypeError` at the venue; a third leg too | **high** |
+| F5 | Plan price levels never reach hook paths; `take_profit_ladder` unreachable | **high** |
+| F7 | Severity-5 objection approved by the gate | **high** |
+| F6 | Soak evidence is nine identical `enter_laddered` cycles, all approved | **medium** |
+| F8 | Gate is a pass-through for seven of twelve actions | **medium** |
+| F10 | Approved size is not the placed size; venue re-derives from the wallet | **medium** |
+| F11 | No staleness input anywhere in the gate | **medium** |
+| F14 | Early-signal layer bypasses the quota manager | **medium** |
+| F15 | Quota accounting is per process | **medium** |
+| F16 | Two tautological tests; ledger completeness test blind to F3 | **medium** |
+| F12 | Dead config keys in `risk_limits.yaml`; "22 rules" vs 23 | **low** |
+| F17 | MCP name spelling deviation; two stale numbers in the status doc | **low** |
+
+Findings I could not reproduce are labelled as such above; there are none in the table. Everything in
+it was reproduced with a command whose output is quoted in its section.
+
 ---
 
 ## F13 — the kill switch is not on any production path, and `/flat` closes nothing
