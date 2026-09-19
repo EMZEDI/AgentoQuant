@@ -23,10 +23,6 @@ block column (the block number lives inside ``raw_text_or_ref``). See
 
 from __future__ import annotations
 
-import json
-import threading
-import time
-import xml.etree.ElementTree as ElementTree
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -35,28 +31,12 @@ import httpx
 import pytest
 
 from agentoquant.data.early_signals import (
-    EVENT_TYPES,
-    PRODUCER_ROLE_PREFIX,
     HttpFetcher,
     JsonlLog,
-    Listener,
-    ListenerStats,
-    SignalEvent,
     SignalWriter,
-    listener_cycle_id,
-    utcnow,
-)
-from agentoquant.data.early_signals import (
     bybit_listings,
-    github_releases,
-    google_news_rss,
-    kraken_listings,
-    okx_listings,
-    telegram_previews,
 )
-from agentoquant.data.early_signals import onchain_webhooks as onchain
-from agentoquant.data.early_signals import runner as runner_module
-from agentoquant.enums import Harness, ModelFamily, SourceClass, Stage
+from agentoquant.enums import SourceClass
 from agentoquant.ledger.store import LedgerStore
 
 # ----------------------------------------------------------------------------------------------
