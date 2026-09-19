@@ -121,6 +121,9 @@ REBALANCE_HOUR = 0
 #: The default take-profit ladder, in freqtrade's minimal-ROI form: minutes after entry -> ratio.
 DEFAULT_MINIMAL_ROI: dict[str, float] = dict(MINIMAL_ROI_LADDER)
 
+#: Fallback for ``risk_limits.execution.min_order_cost_usd`` when the config cannot be read.
+MIN_ORDER_COST_USD_DEFAULT = 5.0
+
 #: Fractions of the position a take-profit ladder takes off, largest first.
 PARTIAL_EXIT_FRACTIONS: tuple[float, ...] = PARTIAL_EXIT_STEPS
 
@@ -142,13 +145,18 @@ class OrderNotPlacedError(RuntimeError):
     """An intent that reached the venue and was refused before any order existed.
 
     Carries the named rule that fired so the loop can record a refusal instead of a crash: a missing
-    trade id, a size below the venue's minimum, a price the venue would not accept.
+    trade id, a size below the venue's minimum, a price the venue would not accept. Also raised while
+    planning, with no intent yet, when the plan itself asks for an order the venue would drop.
     """
 
-    def __init__(self, intent: OrderIntent, *, rule_fired: str, message: str | None = None) -> None:
+    def __init__(
+        self, intent: OrderIntent | None = None, *, rule_fired: str, message: str | None = None
+    ) -> None:
         self.intent = intent
         self.rule_fired = rule_fired
-        super().__init__(message or f"{intent.action.value} ({intent.freqtrade_call}): {rule_fired}")
+        name = getattr(getattr(intent, "action", None), "value", "order")
+        call = getattr(intent, "freqtrade_call", "")
+        super().__init__(message or f"{name} ({call}): {rule_fired}")
 
 
 def is_rejected_action(action: Any) -> bool:
@@ -671,6 +679,44 @@ class OrderManager:
     def max_reprices(self) -> int:
         return int(self.execution_limits.max_reprices)
 
+    @property
+    def min_order_cost_usd(self) -> float:
+        """The smallest notional the venue accepts, from ``risk_limits.execution``."""
+        configured = getattr(self.execution_limits, "min_order_cost_usd", None)
+        try:
+            return float(configured) if configured else MIN_ORDER_COST_USD_DEFAULT
+        except (TypeError, ValueError):  # pragma: no cover - the config model types this
+            return MIN_ORDER_COST_USD_DEFAULT
+
+    def check_exit_size(self, notional: float | None, request: _PlanRequest) -> float | None:
+        """Refuse or lift an exit the venue would round away to nothing.
+
+        freqtrade computes the exit amount as ``stake * amount / trade.stake_amount`` and rounds it to
+        the pair's precision; below the venue's minimum that rounds to zero and it logs "Wanted to
+        exit of ... but exit amount is now 0.0 due to exchange limits - not exiting", which is a
+        silent no-op the pipeline used to record as a filled plan.
+
+        Returns the notional to exit (raised to the venue's floor when the position can carry it) or
+        raises :class:`OrderNotPlacedError` with ``RULE_BELOW_MIN_ORDER_SIZE``.
+        """
+        if notional is None:
+            return None
+        floor = self.min_order_cost_usd
+        if float(notional) >= floor:
+            return float(notional)
+        position = request.position_amount
+        price = request.price
+        if position is not None and price and abs(float(position) * float(price)) >= floor:
+            # Shrink the position by the smallest order the venue accepts instead of not exiting.
+            return floor
+        raise OrderNotPlacedError(
+            rule_fired=RULE_BELOW_MIN_ORDER_SIZE,
+            message=(
+                f"exit of {float(notional):.8f} is below the venue minimum of {floor:.2f} and the "
+                f"position cannot carry the minimum (rule {RULE_BELOW_MIN_ORDER_SIZE})"
+            ),
+        )
+
     # -- planning -------------------------------------------------------------------------------
 
     def plan(
@@ -691,6 +737,7 @@ class OrderManager:
         current_stop: float | None = None,
         trail_percent: float | None = None,
         amount: float | None = None,
+        position_amount: float | None = None,
     ) -> ExecutionPlan:
         """The plan for one card. Refuses a banned action before anything else is considered."""
         return self.plan_for_action(
@@ -710,6 +757,7 @@ class OrderManager:
             current_stop=current_stop,
             trail_percent=trail_percent,
             amount=amount,
+            position_amount=position_amount,
         )
 
     def plan_for_action(
@@ -731,6 +779,7 @@ class OrderManager:
         current_stop: float | None = None,
         trail_percent: float | None = None,
         amount: float | None = None,
+        position_amount: float | None = None,
     ) -> ExecutionPlan:
         """Build the plan for an action name or member, with or without a gate verdict.
 
@@ -770,8 +819,24 @@ class OrderManager:
             current_stop=current_stop,
             trail_percent=trail_percent,
             amount=amount,
+            position_amount=position_amount,
         )
-        intents, detail = self._build(resolved, path, request)
+        try:
+            intents, detail = self._build(resolved, path, request)
+        except OrderNotPlacedError as exc:
+            # The plan itself asks for an order the venue would drop (a size below its minimum, a
+            # price it would not accept). Recorded as a refusal with its rule, not as a crash and not
+            # as a silent no-op.
+            return ExecutionPlan(
+                cycle_id=cycle_id,
+                action=resolved,
+                path=path,
+                approved=True,
+                intents=(),
+                rule_fired=exc.rule_fired,
+                decision_card_id=card_id,
+                detail=f"refused while planning: {exc}",
+            )
         return ExecutionPlan(
             cycle_id=cycle_id,
             action=resolved,
@@ -995,6 +1060,9 @@ class OrderManager:
         """
         stake = round(self.stake_amount(request.size_pct) * fraction, 8)
         limit_price = self._limit_price(request.price, LADDER_OFFSETS_PCT[0], side="sell")
+        # A partial exit the venue would round to zero is not an exit: pre-check it here, so the
+        # pipeline records a refusal (or a lifted order) instead of a silent no-op.
+        stake = round(float(self.check_exit_size(stake, request) or 0.0), 8)
         amount = request.amount
         if amount is None and limit_price:
             amount = round(stake / limit_price, 8)
@@ -1031,6 +1099,15 @@ class OrderManager:
             order_type = "post_only_limit"
             purpose = PURPOSE_EXIT
         assert_order_type_allowed(order_type, purpose, limits=self.execution_limits)
+        if not request.emergency:
+            # An emergency close is attempted whatever its size; an ordinary exit below the venue's
+            # minimum is refused by name instead of being rounded away by the venue.
+            notional = None
+            if request.amount is not None and request.price:
+                notional = abs(float(request.amount) * float(request.price))
+            elif request.size_pct:
+                notional = self.stake_amount(request.size_pct)
+            self.check_exit_size(notional, request)
         limit_price = (
             None
             if request.emergency
@@ -1490,6 +1567,7 @@ class _PlanRequest:
     current_stop: float | None = None
     trail_percent: float | None = None
     amount: float | None = None
+    position_amount: float | None = None
 
     @property
     def pair(self) -> str | None:

@@ -388,6 +388,10 @@ class ExecutionLimits(_Strict):
     mandatory_stop_on_exchange: bool = True
     max_reprices: int = Field(ge=0, le=10)
     market_orders_allowed_for: list[str] = Field(default_factory=list)
+    #: The smallest notional the venue accepts, in quote currency. Below it an exit is not a small
+    #: exit, it is no exit at all: freqtrade rounds the amount to zero and logs
+    #: "Wanted to exit of ... but exit amount is now 0.0 due to exchange limits - not exiting".
+    min_order_cost_usd: float = Field(default=5.0, gt=0)
 
 
 class LiquidityLimits(_Strict):

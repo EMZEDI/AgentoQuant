@@ -358,13 +358,66 @@ class AgentBridgeStrategy(IStrategy):
         stake = self._stake_for(current_rate, size_pct, min_stake, max_stake)
 
         if action == "add":
+            floor = float(min_stake or 0.0)
+            if floor and stake < floor:
+                # Never lift an add to the venue minimum: the Risk Gate approved this size and the
+                # execution layer may only shrink or refuse, never enlarge.
+                self._ack(
+                    document,
+                    {
+                        "action": "add_refused",
+                        "pair": trade.pair,
+                        "reason": (
+                            f"add of {stake:.8f} is below the venue minimum of {floor:.8f} "
+                            "(rule below_min_order_size)"
+                        ),
+                    },
+                )
+                return None
             self._ack(document, {"action": "add", "pair": trade.pair, "stake": stake})
             return stake, "dca_add"
 
         if action == "trim":
             fraction = float(self.config.get("agent_trim_fraction", 0.5) or 0.5)
-            reduce_by = min(stake * fraction, float(trade.stake_amount or stake * fraction))
-            self._ack(document, {"action": "trim", "pair": trade.pair, "stake": -reduce_by})
+            position_stake = float(trade.stake_amount or 0.0)
+            position_amount = float(trade.amount or 0.0)
+            if position_stake <= 0 or position_amount <= 0:
+                # An empty trade has nothing to reduce, and a negative stake against one is the call
+                # freqtrade answers with "Wanted to exit of ... amount, but exit amount is now 0.0
+                # due to exchange limits - not exiting": a no-op that used to be acked as a trim.
+                self._ack(
+                    document,
+                    {
+                        "action": "trim_refused",
+                        "pair": trade.pair,
+                        "reason": "the trade holds no position to reduce",
+                    },
+                )
+                return None
+            floor = float(min_stake or 0.0)
+            reduce_by = min(stake * fraction, position_stake)
+            if floor and reduce_by < floor:
+                if position_stake > floor:
+                    # Shrink by the smallest order the venue accepts rather than asking for one it
+                    # will round away to zero.
+                    reduce_by = floor
+                else:
+                    self._ack(
+                        document,
+                        {
+                            "action": "trim_refused",
+                            "pair": trade.pair,
+                            "reason": (
+                                f"exit of {reduce_by:.8f} is below the venue minimum of {floor:.8f} "
+                                "and the position cannot carry the minimum"
+                            ),
+                        },
+                    )
+                    return None
+            self._ack(
+                document,
+                {"action": "trim", "pair": trade.pair, "stake": -reduce_by, "min_stake": floor},
+            )
             return -reduce_by, "partial_exit"
 
         if action == "enter_laddered":

@@ -35,6 +35,10 @@ execution:
   mandatory_stop_on_exchange: true
   max_reprices: 3
   market_orders_allowed_for: [stop_loss, emergency_exit]
+  # The smallest order Kraken accepts, in USD. Kraken's own floor is per pair and comes out around
+  # $5 at Tier 1; below it an exit is rounded to zero and silently does nothing, so the execution
+  # layer pre-checks against this and either lifts the order to the floor or refuses it by name.
+  min_order_cost_usd: 5.0
 
 liquidity:
   # 24-hour quote volume below this and the coin is untradeable. Initial value, tunable.
