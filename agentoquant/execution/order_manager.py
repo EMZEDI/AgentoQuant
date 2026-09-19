@@ -79,6 +79,10 @@ RULE_BELOW_MIN_ORDER_SIZE = "below_min_order_size"
 #: A limit price too far from the venue's own last price to be a real post-only order.
 RULE_PRICE_AWAY_FROM_MARKET = "price_away_from_market"
 
+#: How far a planned limit price may sit from the venue's own last price before it is re-anchored, in
+#: percent. A post-only entry further away than this cannot fill on this cycle.
+MAX_PRICE_DEVIATION_PCT = 1.0
+
 #: The venue answered a call with a refusal message instead of placing anything.
 RULE_VENUE_REFUSED = "venue_refused"
 
@@ -87,6 +91,11 @@ REJECTED_EXECUTION_ACTIONS: tuple[str, ...] = tuple(REJECTED_ACTIONS)
 
 #: Order types the addendum allows in an ``execution`` record.
 ORDER_TYPES: tuple[str, ...] = ("post_only_limit", "market", "stop_loss", "stop_loss_limit")
+
+#: Order types the venue executes as taker orders, so they pay the taker rate. freqtrade's config
+#: declares ``stoploss: market`` and ``emergency_exit: market``, so a stop that is planned as a
+#: stop-limit still fills at the taker rate - pricing it at the maker rate would halve its real cost.
+TAKER_EXECUTION_TYPES: tuple[str, ...] = ("market", "stop_loss", "stop_loss_limit")
 
 #: Execution record statuses, from the addendum's ``execution`` payload.
 STATUS_FILLED = "filled"
@@ -314,15 +323,20 @@ DEFAULT_MARKET_PURPOSES: tuple[str, ...] = (PURPOSE_STOP_LOSS, PURPOSE_EMERGENCY
 
 
 def assert_order_type_allowed(
-    order_type: str, purpose: str, *, limits: ExecutionLimits | None = None
+    order_type: str, purpose: str, *, limits: ExecutionLimits | Any | None = None
 ) -> None:
     """Refuse a taker order for a purpose the plan does not allow.
 
-    Stops and emergency exits are the only taker orders; everything else is post-only.
+    Stops and emergency exits are the only taker orders; everything else is post-only. ``limits`` is
+    the execution section; a whole ``RiskLimits`` is accepted too, because handing the wrong one of
+    the two to a guard that only reads it should not be a silent AttributeError.
     """
     if order_type != "market":
         return
-    allowed = tuple(limits.market_orders_allowed_for) if limits is not None else DEFAULT_MARKET_PURPOSES
+    section = getattr(limits, "execution", limits)
+    allowed = (
+        tuple(section.market_orders_allowed_for) if section is not None else DEFAULT_MARKET_PURPOSES
+    )
     if purpose not in allowed:
         raise UnsupportedActionError(
             purpose,
@@ -735,16 +749,33 @@ class OrderManager:
         """A card's ``size_pct`` as money, at the current book value."""
         return round(self.book_value_usd() * float(size_pct) / 100.0, 8)
 
-    def fee_pct(self, order_type: str) -> float:
-        """The fee percent for this order type at the configured tier (Tier 1 maker 0.40)."""
-        tier = self.fee_tiers.current
-        return float(tier.taker_pct if order_type == "market" else tier.maker_pct)
+    def fee_pct(self, order_type: str, purpose: str | None = None) -> float:
+        """The fee percent for this order at the configured tier.
 
-    def fee_for(self, fill_price: float | None, fill_qty: float | None, order_type: str) -> float | None:
+        Two rates, not one: a post-only limit fill pays the maker rate and a fill the venue executes
+        as a taker order pays the taker rate. The venue's own dry-run ``fee`` is a single flat rate
+        (the maker one), so a stop fill is simulated at half its real cost; pricing the ledger record
+        from ``config/fee_tiers.yaml`` is what keeps the two-rate schedule honest.
+        """
+        tier = self.fee_tiers.current
+        taker = order_type in TAKER_EXECUTION_TYPES or purpose in {
+            PURPOSE_STOP_LOSS,
+            PURPOSE_EMERGENCY_EXIT,
+        }
+        return float(tier.taker_pct if taker else tier.maker_pct)
+
+    def fee_for(
+        self,
+        fill_price: float | None,
+        fill_qty: float | None,
+        order_type: str,
+        purpose: str | None = None,
+    ) -> float | None:
         """Fee paid on a fill, at the configured tier. ``None`` when nothing filled."""
         if fill_price is None or fill_qty is None:
             return None
-        return round(float(fill_price) * float(fill_qty) * self.fee_pct(order_type) / 100.0, 10)
+        rate = self.fee_pct(order_type, purpose)
+        return round(float(fill_price) * float(fill_qty) * rate / 100.0, 10)
 
     def clock(self) -> datetime:
         moment = self.now or datetime.now(UTC)
@@ -878,11 +909,12 @@ class OrderManager:
                 detail="the risk gate rejected the card: nothing is placed",
             )
         size_pct = float(verdict.final_size_pct) if verdict is not None else 0.0
+        reference_price, price_rule = self.anchor_price(price, pair_for(coin) if coin else None)
         request = _PlanRequest(
             cycle_id=cycle_id,
             coin=coin,
             size_pct=size_pct,
-            price=price,
+            price=reference_price,
             stop_price=stop_price,
             target_price=target_price,
             rotate_from=rotate_from,
@@ -911,6 +943,11 @@ class OrderManager:
                 rule_fired=exc.rule_fired,
                 decision_card_id=card_id,
                 detail=f"refused while planning: {exc}",
+            )
+        if price_rule:
+            detail = (
+                f"{detail} (reference price re-anchored to the venue's own last price: "
+                f"{reference_price}, rule {price_rule})"
             )
         return ExecutionPlan(
             cycle_id=cycle_id,
@@ -1002,6 +1039,25 @@ class OrderManager:
             return float(price) if price is not None else None
         except (TypeError, ValueError):
             return None
+
+    def anchor_price(self, price: float | None, pair: str | None) -> tuple[float | None, str | None]:
+        """Re-anchor a reference price that is too far from the venue's own last price.
+
+        A post-only entry sits below the venue's market. When the pipeline's reference price is stale
+        or wrong - the Phase 0 placeholder carries a fixed 60,000 for BTC while the venue trades at
+        81,232 - the limit can never fill, so it is cancelled and repriced and the ladder never
+        becomes a ladder. The venue's own last price is the only honest anchor, and the deviation is
+        named rather than hidden.
+
+        Returns the price to plan against and, when it moved, ``RULE_PRICE_AWAY_FROM_MARKET``.
+        """
+        venue = self.venue_price(pair)
+        if not venue or not price:
+            return price, None
+        deviation = abs(float(price) - float(venue)) / float(venue) * 100.0
+        if deviation <= MAX_PRICE_DEVIATION_PCT:
+            return price, None
+        return venue, RULE_PRICE_AWAY_FROM_MARKET
 
     def _build(
         self, action: Action, path: str, request: _PlanRequest
@@ -1599,7 +1655,7 @@ class OrderManager:
             status = STATUS_FILLED if report.get("fill_qty") else STATUS_UNFILLED_TIMEOUT
         fill_price = report.get("fill_price")
         fill_qty = report.get("fill_qty")
-        fee_paid = self.fee_for(fill_price, fill_qty, intent.order_type)
+        fee_paid = self.fee_for(fill_price, fill_qty, intent.order_type, intent.purpose)
         payload = ExecutionPayload(
             decision_card_id=card_id or "",
             order_type=intent.order_type,
@@ -1622,7 +1678,7 @@ class OrderManager:
             "fill_price": fill_price,
             "fill_qty": fill_qty,
             "fee_paid": fee_paid,
-            "fee_pct": self.fee_pct(intent.order_type),
+            "fee_pct": self.fee_pct(intent.order_type, intent.purpose),
             "reprice_count": payload.reprice_count,
             "stake_amount": intent.stake_amount,
             "price": intent.price,
@@ -1675,6 +1731,7 @@ __all__ = [
     "EXECUTION_PATHS",
     "FREQTRADE_CALLS",
     "LADDER_OFFSETS_PCT",
+    "MAX_PRICE_DEVIATION_PCT",
     "NullTransport",
     "ORDER_TYPES",
     "OrderIntent",
@@ -1697,6 +1754,7 @@ __all__ = [
     "RULE_VENUE_REFUSED",
     "STATUSES",
     "SIZE_FREE_PATHS",
+    "TAKER_EXECUTION_TYPES",
     "UnsupportedActionError",
     "assert_order_type_allowed",
     "coerce_action",
