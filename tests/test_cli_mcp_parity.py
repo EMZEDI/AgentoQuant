@@ -60,9 +60,47 @@ async def _call_tool(name: str, arguments: dict) -> dict:
 # The two listings match
 # ----------------------------------------------------------------------------------------------
 
+#: The plan's fixed command spellings (plan.md's pipeline-as-a-tool list). Single source of truth for
+#: both the CLI assertion and the MCP mapping below.
+PLAN_COMMANDS: tuple[str, ...] = (
+    "ingest",
+    "forecast",
+    "decide",
+    "paper",
+    "review",
+    "retrain",
+    "backtest",
+    "propose-skill",
+    "ledger query",
+    "worldview get",
+    "worldview flag",
+    "fund request",
+)
 
-def test_mcp_tool_listing_matches_the_cli_registry() -> None:
-    assert registered_tool_names() == cli.mcp_tool_names()
+
+def plan_command_to_tool_name(plan_command: str) -> str:
+    """The MCP tool name a plan command is exposed under.
+
+    MCP tool names must be identifier-safe, so the plan's hyphens and spaces become underscores.
+    That is a stated deviation from the literal spelling, which is why the mapping is asserted.
+    """
+    return plan_command.replace("-", "_").replace(" ", "_")
+
+
+def test_the_registry_helper_agrees_with_the_real_server_session() -> None:
+    """``registered_tool_names()`` delegates to the CLI helper, so check it against a real session.
+
+    This replaces ``assert registered_tool_names() == cli.mcp_tool_names()``, which compared a
+    function to itself - ``registered_tool_names`` IS ``cli.mcp_tool_names`` - and could never fail
+    (adversary finding F16).
+    """
+    assert list(registered_tool_names()) == asyncio.run(_list_tools())
+
+
+def test_the_exposed_tool_names_map_to_the_plans_fixed_command_names() -> None:
+    """Every plan command is exposed, under the underscore spelling, and nothing else is."""
+    exposed = set(asyncio.run(_list_tools()))
+    assert exposed == {plan_command_to_tool_name(name) for name in PLAN_COMMANDS}
 
 
 def test_mcp_server_lists_the_same_tools_over_a_real_session() -> None:
@@ -71,21 +109,7 @@ def test_mcp_server_lists_the_same_tools_over_a_real_session() -> None:
 
 
 def test_every_plan_command_exists_as_a_leaf_command() -> None:
-    expected = {
-        "ingest",
-        "forecast",
-        "decide",
-        "paper",
-        "review",
-        "retrain",
-        "backtest",
-        "propose-skill",
-        "ledger query",
-        "worldview get",
-        "worldview flag",
-        "fund request",
-    }
-    assert set(cli.cli_command_names()) == expected
+    assert set(cli.cli_command_names()) == set(PLAN_COMMANDS)
 
 
 def test_cli_help_lists_every_top_level_command() -> None:

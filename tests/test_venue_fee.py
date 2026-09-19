@@ -21,9 +21,11 @@ import pytest
 from agentoquant.config_loader import load_fee_tiers, repo_root
 from agentoquant.execution.freqtrade_strategy import (
     CONFIG_FILENAME,
+    TAKER_ORDER_TYPES,
     USER_DATA_DIRNAME,
     BridgeConfigError,
     assert_dry_run_config,
+    venue_fee_optimism,
 )
 
 
@@ -97,3 +99,50 @@ def test_the_existing_dry_run_checks_still_fire(tmp_path: Path) -> None:
     wrong_venue["exchange"]["name"] = "binance"
     with pytest.raises(BridgeConfigError, match="exchange.name is not kraken"):
         assert_dry_run_config(write_config(tmp_path, wrong_venue))
+
+
+# ----------------------------------------------------------------------------------------------
+# The known optimism, pinned rather than hidden (adversary finding F18)
+# ----------------------------------------------------------------------------------------------
+
+# One flat dry-run fee cannot express a two-rate schedule, and the config declares stops and
+# emergency exits as market orders, which really pay the taker rate. The venue therefore
+# under-charges every stop fill by the maker-to-taker gap. That is accepted - the maker round trip
+# is what the plan's decision rule is written against - but it is asserted here so it cannot drift
+# silently, and the ledger prices each fill at its own order type's rate to cancel it out.
+
+
+def taker_rate() -> float:
+    tiers = load_fee_tiers()
+    return float(tiers.tier(tiers.current_tier).taker_pct) / 100.0
+
+
+def test_the_shipped_config_declares_its_stops_as_market_orders() -> None:
+    """The premise of the exposure: if this changes, the numbers below change with it."""
+    order_types = shipped_config()["order_types"]
+    for name in TAKER_ORDER_TYPES:
+        assert order_types[name] == "market"
+
+
+def test_the_known_stop_optimism_is_the_maker_to_taker_gap() -> None:
+    config = shipped_config()
+    assert venue_fee_optimism(config) == pytest.approx(taker_rate() - current_maker_rate())
+
+
+def test_pricing_the_venue_at_the_taker_rate_leaves_no_optimism(tmp_path: Path) -> None:
+    config = shipped_config()
+    config["fee"] = taker_rate()
+    assert venue_fee_optimism(config) == 0.0
+    assert_dry_run_config(write_config(tmp_path, config))
+
+
+def test_a_config_with_limit_stops_has_no_taker_exposure() -> None:
+    config = shipped_config()
+    config["order_types"] = dict(config["order_types"], stoploss="limit", emergency_exit="limit")
+    assert venue_fee_optimism(config) == 0.0
+
+
+def test_a_config_with_no_fee_at_all_is_optimistic_by_the_whole_taker_rate() -> None:
+    config = shipped_config()
+    config.pop("fee")
+    assert venue_fee_optimism(config) == pytest.approx(taker_rate())

@@ -11,11 +11,11 @@ where something could not be verified it says so instead of guessing.
 | 1 | Package skeleton, seven config files, enums, config loader, CLI (11 commands) and an MCP server exposing the same leaves | `uv lock --check` clean (138 packages); 41 tests; `agentoquant ingest` exit 3 with no traceback; MCP over stdio exposes 12 tools |
 | 2 | Fourteen-stage decision ledger in DuckDB, named queries, cost meter | 14 tables; `ledger query --query cycles` returns 4 cycles with 14/12/13/14 stages; field-name drift against addendum §4–6: 0 |
 | 3 | Quota manager, cache, seven connectors, hourly snapshot orchestrator | Live snapshot across every source; four positional-argument wiring bugs found and fixed with a regression test that drives the real registry |
-| 4 | Early-signal listeners (Bybit, OKX, Kraken, GitHub releases, Google News RSS, Telegram previews, on-chain webhooks) and a runner | Live 90 s run: 892 events, 0 failures, 0 restarts, every record carrying a `source_class` |
-| 5 | Deterministic Risk Gate (22 rules), kill switch, funding floor | 18/18 acceptance checks against a real ledger; 133 adversarial tests, one case per rule |
+| 4 | Early-signal listeners (Bybit, OKX, Kraken, GitHub releases, Google News RSS, Telegram previews, on-chain webhooks) and a runner | Live 90 s run: 892 events, 0 failures, 0 restarts, every record carrying a `source_class`; per-module suites now total 178 tests, and each of the three acceptance criteria is verified **by mutation** — revert the behaviour, watch the test fail |
+| 5 | Deterministic Risk Gate (23 rules), kill switch, funding floor | 18/18 acceptance checks against a real ledger; 27 adversarial tests, one case per rule |
 | 6 | Paper harness, freqtrade dry-run bridge, order manager for the twelve-action vocabulary, signal store, Telegram notifier, scheduler, systemd units | 24 consecutive cycles, 0 failures, three real dry-run trades each tagged with its cycle id |
 
-Gate on `main`: **227 tests pass, 1 skipped (opt-in live cost check), ruff clean.**
+Gate on `main`: **376 tests pass, 1 skipped (opt-in live cost check), ruff clean.**
 
 ## The loop is running unattended
 
@@ -104,6 +104,33 @@ not a trigger.
 Mitigation, in `.hermes.md` and `scripts/at_restore.py` (`mark` / `unmark`, exact inverses, round
 trip verified lossless): write `AT_MARK_` where a decorator's at-sign belongs, convert on disk
 before running pytest, and **commit after every file write**.
+
+## Adversary findings and ownership
+
+`docs/reviews/phase0_adversary.md` (merged) lists 18 reproduced findings. Every one now has an owner.
+The areas are deliberately disjoint: two agents in one file is how a merge conflict turns into lost
+work.
+
+| Finding | Sev | Owner |
+|---|---|---|
+| F13 kill switch unwired, `/flat` closes nothing | **blocker** | execution agent |
+| F1 execution rows report fills as `unfilled_timeout` | high | execution agent |
+| F4 `exit` and `cancel_order` throw `TypeError` at the venue | high | execution agent |
+| F5 plan price levels never reach hook paths; `take_profit_ladder` unreachable | high | execution agent |
+| F10 approved size is not the placed size | medium | execution agent |
+| F7 a severity-5 objection is approved | high | risk-gate agent |
+| F8 the gate is a pass-through for seven actions | medium | risk-gate agent |
+| F11 nothing detects stale data | medium | risk-gate agent |
+| F12 dead config keys; rule count 22 vs 23 | low | risk-gate agent |
+| F14 early signals bypass the quota manager | medium | quota agent |
+| F15 quota accounting is per process | medium | quota agent |
+| F3 the `outcome` stage has no writer | high | outcomes agent |
+| F2 two `risk_gate_verdict` rows per cycle | high | outcomes agent |
+| F9 the Ontario net-buy cap can never bind | high | outcomes agent (depends on F1) |
+| F16 tests that cannot fail | medium | **parity tautology fixed**; the ledger completeness test still needs F3 to land first |
+| F17 MCP name spelling; two stale numbers | low | **fixed** — the underscore mapping is now asserted as a stated deviation, and the two stale counts (22 rules, 133 tests) were corrected to 23 and 27 |
+| F18 the fee floor is the maker rate, so stops are simulated 0.4% cheap | medium | phase agent (documented, not fixed) |
+| F6 the soak evidence was nine identical cycles | medium | **fixed** (rotation, `tests/test_paper_sequence.py`) |
 
 ## Next
 
