@@ -121,7 +121,35 @@ def assert_dry_run_config(path: Path | str | None = None) -> dict[str, Any]:
             raise BridgeConfigError(
                 f"exchange.{key} carries a value: keys belong in the environment, never in the repo"
             )
+    _assert_venue_fee_not_flattering(config)
     return config
+
+
+def _assert_venue_fee_not_flattering(config: dict[str, Any]) -> None:
+    """Fail closed unless the dry-run venue charges at least the account's tier.
+
+    freqtrade honours a top-level ``fee`` in dry-run and otherwise falls back to the exchange's
+    published schedule, which is *cheaper* than this account's tier: ccxt reports 0.26% for BTC/USD
+    while the account sits on Tier 1 at 0.40% maker. A soak on the cheaper number would report a
+    P&L the account can never earn, so the config must state the fee and it must not sit below the
+    tier the book is actually on. Being pessimistic is allowed; being optimistic is not.
+    """
+    tiers = load_fee_tiers()
+    tier = tiers.tier(tiers.current_tier)
+    floor = float(tier.maker_pct) / 100.0
+
+    fee = config.get("fee")
+    if fee is None:
+        raise BridgeConfigError(
+            "dry_run is on but no fee is configured: freqtrade would charge the exchange's "
+            f"published schedule instead of {tiers.current_tier} (maker {tier.maker_pct}%), and "
+            "every simulated fill would be cheaper than the real one"
+        )
+    if float(fee) < floor:
+        raise BridgeConfigError(
+            f"dry-run fee {float(fee):.4f} is below the {tiers.current_tier} maker rate "
+            f"{floor:.4f}: the venue would flatter every fill"
+        )
 
 
 def check_strategy_hygiene(source: str | None = None) -> list[str]:
