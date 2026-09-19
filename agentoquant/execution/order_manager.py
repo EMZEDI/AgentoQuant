@@ -277,7 +277,7 @@ FREQTRADE_CALLS: dict[str, str] = {
     "event_trade_with_time_stop": "forceenter+custom_exit",
     "scheduled_weekly_rebalance": "rebalance",
     "hold_no_op": "none",
-    "cancel_or_amend_resting": "cancel_open_order+amend_order",
+    "cancel_or_amend_resting": "cancel_open_order+forceenter",
 }
 
 #: Paths that only manage an existing position and therefore carry no size.
@@ -419,7 +419,6 @@ class _FreqtradeDryRunTransport:
         "entry_tag": "enter_tag",
         "stakeamount": "stake_amount",
         "trade_id": "tradeid",
-        "order_id": "trade_id",
     }
 
     def __init__(self, client: Any, base_url: str) -> None:
@@ -1124,44 +1123,24 @@ class OrderManager:
         return [intent], detail
 
     def _cancel_or_amend(self, action: Action, request: _PlanRequest) -> tuple[list[OrderIntent], str]:
-        """Cancel a resting order, or amend it in place.
+        """Cancel a resting order, then place the replacement.
 
-        ``AmendOrder`` keeps the queue position when the quantity goes down, so a pure quantity
-        decrease is an amend with ``keep_queue_position`` set; a price change or an increase is a
-        cancel followed by a fresh order.
+        A Kraken ``AmendOrder`` would keep the queue position on a pure quantity decrease, but
+        freqtrade's REST API in 2026.8 exposes no amend endpoint and interface version 3 has no amend
+        hook, so the reachable path is cancel-and-replace. ``keep_queue_position`` is therefore always
+        false here: claiming otherwise would be a lie the venue cannot honour.
         """
         order = dict(request.resting_order)
-        order_id = order.get("order_id")
+        order_id = order.get("order_id") or order.get("trade_id")
         if not order_id:
             return [], "no resting order given: nothing to cancel or amend"
         pair = order.get("pair") or request.pair
-        current_qty = order.get("current_quantity")
         new_qty = order.get("new_quantity")
         new_price = order.get("new_price")
-        quantity_decrease = (
-            current_qty is not None and new_qty is not None and float(new_qty) < float(current_qty)
-        )
-        if quantity_decrease and new_price is None:
-            intent = OrderIntent(
-                action=action,
-                path="cancel_or_amend_resting",
-                pair=pair,
-                purpose=PURPOSE_CANCEL,
-                side="none",
-                order_type="post_only_limit",
-                freqtrade_call="amend_order",
-                freqtrade_kwargs={
-                    "pair": pair,
-                    "order_id": order_id,
-                    "qty": new_qty,
-                    "keep_queue_position": True,
-                },
-                amount=new_qty,
-                post_only=True,
-                keep_queue_position=True,
-                notes="quantity decrease: amend in place and keep the queue position",
-            )
-            return [intent], "amend in place, queue position kept"
+        side = order.get("side", "buy")
+        cancel_kwargs: dict[str, Any] = {"pair": pair, "order_id": order_id}
+        if order.get("trade_id") is not None:
+            cancel_kwargs["trade_id"] = order["trade_id"]
         intents = [
             OrderIntent(
                 action=action,
@@ -1171,36 +1150,47 @@ class OrderManager:
                 side="none",
                 order_type="post_only_limit",
                 freqtrade_call="cancel_open_order",
-                freqtrade_kwargs={"pair": pair, "order_id": order_id},
+                freqtrade_kwargs=cancel_kwargs,
                 post_only=True,
                 notes="cancel the resting order",
             )
         ]
         if new_price is not None or new_qty is not None:
+            replacement = "forceenter" if side == "buy" else "forceexit"
+            kwargs: dict[str, Any] = {
+                "pair": pair,
+                "entry_tag": f"reprice:{request.cycle_id}",
+                "exit_tag": f"reprice:{request.cycle_id}",
+            }
+            if side == "buy":
+                kwargs["side"] = "long"
+                kwargs["ordertype"] = "limit"
+                kwargs["price"] = new_price
+                kwargs["amount"] = new_qty
+            else:
+                kwargs["ordertype"] = "limit"
+                kwargs["amount"] = new_qty
             intents.append(
                 OrderIntent(
                     action=action,
                     path="cancel_or_amend_resting",
                     pair=pair,
                     purpose=PURPOSE_CANCEL,
-                    side=order.get("side", "buy"),
+                    side=side,
                     order_type="post_only_limit",
-                    freqtrade_call="forceenter",
-                    freqtrade_kwargs={
-                        "pair": pair,
-                        "ordertype": "limit",
-                        "price": new_price,
-                        "amount": new_qty,
-                        "entry_tag": f"reprice:{request.cycle_id}",
-                    },
+                    freqtrade_call=replacement,
+                    freqtrade_kwargs=kwargs,
                     price=new_price,
                     amount=new_qty,
                     post_only=True,
                     reprices_allowed=self.max_reprices,
-                    notes="replacement order after the cancel; a reprice loses the queue position",
+                    notes=(
+                        "replacement order after the cancel; a price change loses the queue position "
+                        "and the venue exposes no amend"
+                    ),
                 )
             )
-        return intents, "cancel and replace: a price change does not keep the queue position"
+        return intents, "cancel and replace: no amend endpoint, so the queue position is lost"
 
     # -- submitting and recording ---------------------------------------------------------------
 
