@@ -79,6 +79,9 @@ RULE_BELOW_MIN_ORDER_SIZE = "below_min_order_size"
 #: A limit price too far from the venue's own last price to be a real post-only order.
 RULE_PRICE_AWAY_FROM_MARKET = "price_away_from_market"
 
+#: The venue answered a call with a refusal message instead of placing anything.
+RULE_VENUE_REFUSED = "venue_refused"
+
 #: The rejected vocabulary, verbatim from ``agentoquant/enums.py``.
 REJECTED_EXECUTION_ACTIONS: tuple[str, ...] = tuple(REJECTED_ACTIONS)
 
@@ -582,9 +585,81 @@ class _FreqtradeDryRunTransport:
                 )
             kwargs[id_arg] = trade_id
         result = handler(**kwargs)
-        if isinstance(result, dict):
-            return result
-        return {"status": STATUS_FILLED if result else STATUS_UNFILLED_TIMEOUT, "raw": result}
+        return self._normalise(call, result, kwargs)
+
+    def _normalise(self, call: str, result: Any, kwargs: Mapping[str, Any]) -> dict[str, Any]:
+        """Turn the venue's own answer into the fields an ``execution`` record carries.
+
+        The API returns what it returns: ``forceenter`` answers with the trade schema (trade_id,
+        amount, open_rate), ``forceexit`` and ``cancel_open_order`` answer with a status message and
+        nothing about fills. Reading the trade back is what turns "the call did not raise" into "this
+        is what actually happened": without it a filled entry was recorded as ``unfilled_timeout``
+        with a null price, which is what the ledger held after the venue had filled three slices.
+        """
+        if not isinstance(result, dict):
+            return {"status": STATUS_FILLED if result else STATUS_UNFILLED_TIMEOUT, "raw": result}
+        if call == "forceenter":
+            amount = result.get("amount")
+            rate = result.get("open_rate") or result.get("open_rate_requested")
+            filled = bool(amount) and float(amount) > 0
+            if not filled and isinstance(result.get("status"), str) and "trade_id" not in result:
+                # The API answers a refused force entry with a status message, not an exception. That
+                # is a refusal, and it must not read as "the order is resting unfilled".
+                return {
+                    "status": None,
+                    "rejected": True,
+                    "rule_fired": RULE_VENUE_REFUSED,
+                    "venue_message": result.get("status"),
+                    "raw": result,
+                }
+            return {
+                "status": STATUS_FILLED if filled else STATUS_UNFILLED_TIMEOUT,
+                "fill_price": float(rate) if filled and rate else None,
+                "fill_qty": float(amount) if filled else None,
+                "trade_id": result.get("trade_id"),
+                "pair": result.get("pair"),
+                "raw": result,
+            }
+        if call == "cancel_open_order":
+            return {
+                "status": STATUS_CANCELLED,
+                "trade_id": kwargs.get("trade_id"),
+                "raw": result,
+            }
+        return self._trade_report(kwargs.get("tradeid") or kwargs.get("trade_id"), result)
+
+    def _trade_report(self, trade_id: Any, raw: Mapping[str, Any]) -> dict[str, Any]:
+        """What the venue holds for ``trade_id`` now: the fill price, the size and the status."""
+        report: dict[str, Any] = {
+            "status": STATUS_UNFILLED_TIMEOUT,
+            "trade_id": trade_id,
+            "raw": raw,
+        }
+        if trade_id is None:
+            return report
+        try:
+            trade = self._client.trade(trade_id)
+        except Exception:
+            return report
+        if not isinstance(trade, dict):
+            return report
+        amount = trade.get("amount")
+        is_open = bool(trade.get("is_open", True))
+        rate = trade.get("open_rate") if is_open else trade.get("close_rate")
+        report.update(
+            {
+                "pair": trade.get("pair"),
+                "is_open": is_open,
+                "fill_qty": float(amount) if amount else None,
+                "fill_price": float(rate) if rate else None,
+                "status": (
+                    STATUS_FILLED
+                    if (not is_open and trade.get("close_rate"))
+                    else STATUS_UNFILLED_TIMEOUT
+                ),
+            }
+        )
+        return report
 
 
 def coerce_action(value: Any) -> Action:
@@ -1473,6 +1548,26 @@ class OrderManager:
                     }
                 )
                 continue
+            if report.get("rejected"):
+                # The venue answered with a refusal message (a protection lock, a refused force
+                # entry). Recorded as a refusal with its rule, not as an order resting unfilled.
+                reports.append(
+                    {
+                        "cycle_id": cycle_id,
+                        "action": intent.action.value,
+                        "path": intent.path,
+                        "freqtrade_call": intent.freqtrade_call,
+                        "submitted": False,
+                        "reason": (
+                            f"{report.get('rule_fired')}: "
+                            f"{report.get('venue_message') or 'the venue refused the call'}"
+                        ),
+                        "rule_fired": report.get("rule_fired") or RULE_VENUE_REFUSED,
+                        "status": None,
+                        "record_id": None,
+                    }
+                )
+                continue
             reports.append(
                 self._record(
                     intent,
@@ -1599,6 +1694,7 @@ __all__ = [
     "RULE_REJECTED_ACTION",
     "RULE_UNKNOWN_ACTION",
     "RULE_UNKNOWN_TRADE",
+    "RULE_VENUE_REFUSED",
     "STATUSES",
     "SIZE_FREE_PATHS",
     "UnsupportedActionError",
