@@ -349,7 +349,7 @@ def run_kraken(transport: Transport, ctx: RunContext) -> list[ConnectorResult]:
 
     connector = KrakenConnector(transport)
     results: list[ConnectorResult] = list(
-        _call(connector, "kraken_rest", "fetch_market", ctx.symbols, force=ctx.force)
+        _call(connector, "kraken_rest", "fetch_market", symbols=ctx.symbols, force=ctx.force)
     )
     results.extend(_call(connector, "kraken_rest", "fetch_fee_tier", force=ctx.force))
     results.extend(_call(connector, "kraken_rest", "fetch_account"))

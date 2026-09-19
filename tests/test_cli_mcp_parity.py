@@ -105,23 +105,27 @@ def test_ledger_and_worldview_expose_their_subcommands() -> None:
 
 
 # ----------------------------------------------------------------------------------------------
-# A command owned by a later task exits cleanly
+# A command owned by a later phase exits cleanly
 # ----------------------------------------------------------------------------------------------
+#
+# ``ingest`` used to be the example here: it was a stub until Phase 0 Task 3 implemented it, at
+# which point this file's assertions became wrong rather than the code. ``forecast`` is owned by
+# Phase 1 and stays a stub for the whole of Phase 0, so it is the stable example to assert on.
 
 
 def test_unimplemented_command_exits_nonzero_without_a_traceback(call_log: Path) -> None:
     runner = CliRunner()
-    result = runner.invoke(cli.app, ["ingest"])
+    result = runner.invoke(cli.app, ["forecast"])
     assert result.exit_code == EXIT_NOT_IMPLEMENTED
-    assert "not implemented yet (owned by Phase 0 Task 3)" in result.output
+    assert "not implemented yet (owned by Phase 1)" in result.output
     assert "Traceback" not in result.output
 
 
 def test_unimplemented_command_over_mcp_returns_not_implemented(call_log: Path) -> None:
-    payload = asyncio.run(_call_tool("ingest", {}))
+    payload = asyncio.run(_call_tool("forecast", {}))
     assert payload["status"] == "not_implemented"
     assert payload["not_implemented"] is True
-    assert "Phase 0 Task 3" in payload["message"]
+    assert "Phase 1" in payload["message"]
 
 
 # ----------------------------------------------------------------------------------------------
@@ -136,21 +140,21 @@ def _log_lines(path: Path) -> list[dict]:
 
 
 def test_an_mcp_call_and_a_cli_call_land_in_the_same_log(call_log: Path) -> None:
-    asyncio.run(_call_tool("ingest", {}))
+    asyncio.run(_call_tool("forecast", {}))
     runner = CliRunner()
-    result = runner.invoke(cli.app, ["ingest"])
+    result = runner.invoke(cli.app, ["forecast"])
     assert result.exit_code == EXIT_NOT_IMPLEMENTED
 
     records = _log_lines(call_log)
     clients = {record["client"] for record in records}
     assert clients == {"mcp", "cli"}, records
-    assert all(record["command"] == "ingest" for record in records)
+    assert all(record["command"] == "forecast" for record in records)
     assert all(record["status"] == "not_implemented" for record in records)
 
 
 def test_the_call_log_never_records_a_secret(call_log: Path) -> None:
     runner = CliRunner()
-    runner.invoke(cli.app, ["ingest"])
+    runner.invoke(cli.app, ["forecast"])
     raw = call_log.read_text(encoding="utf-8")
     from agentoquant.config_loader import credentials
 
@@ -159,7 +163,7 @@ def test_the_call_log_never_records_a_secret(call_log: Path) -> None:
             assert value not in raw, "a credential value reached the call log"
 
 
-@pytest.mark.parametrize("command", ["forecast", "decide", "paper", "review", "retrain", "backtest"])
+@pytest.mark.parametrize("command", ["forecast", "decide", "review", "retrain", "backtest"])
 def test_phase_later_commands_are_stubs_with_an_owner(command: str, call_log: Path) -> None:
     runner = CliRunner()
     result = runner.invoke(cli.app, [command])

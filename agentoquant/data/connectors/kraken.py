@@ -213,7 +213,9 @@ class KrakenConnector:
             "/0/public/Ticker", {"pair": ",".join(pairs)}, ttl_seconds=ttl_seconds
         )
         index = self.pair_index()
-        by_altname = {index.get(pair, pair): symbol for symbol, pair in zip(symbols, pairs)}
+        by_altname = {
+            index.get(pair, pair): symbol for symbol, pair in zip(symbols, pairs, strict=True)
+        }
         rows: dict[str, dict] = {}
         for key, row in (result or {}).items():
             if key == "last":
