@@ -13,10 +13,10 @@ ordinary argument.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from agentoquant.config_loader import load_risk_limits, repo_root
+from agentoquant.config_loader import load_risk_limits, load_settings, repo_root
 from agentoquant.enums import Action, ConfidenceBand, Sleeve
 from agentoquant.ledger.schema import DecisionCard
 from agentoquant.ledger.store import LedgerStore
@@ -31,6 +31,7 @@ from agentoquant.risk.gate import (
     RULE_MISSING_SIZE,
     RULE_MISSING_STOP,
     RULE_REDUCTION_CAP,
+    RULE_STALE_MARKET_DATA,
     RULE_UNRESOLVED_SEVERITY5,
     RULE_VENUE_STATUS,
     SHRINK_RULES,
@@ -365,3 +366,84 @@ def test_a_ledger_attached_does_not_change_a_verdict(tmp_path: Path) -> None:
             second.final_size_pct,
         ), action
     ledger.close()
+
+
+# ----------------------------------------------------------------------------------------------
+# F11 - nothing in the gate could detect stale data
+# ----------------------------------------------------------------------------------------------
+
+#: One cadence plus a margin, from ``config/settings.yaml`` (60 minutes).
+STALENESS_LIMIT_S = 2 * 60 * 60
+
+
+def test_the_staleness_limit_follows_the_cadence() -> None:
+    """The limit is derived from ``settings.cadence_minutes``, not invented inside the gate."""
+    cadence_s = float(load_settings().cadence_minutes) * 60.0
+    assert make_gate().max_market_data_age_s == cadence_s * 2.0 == STALENESS_LIMIT_S
+
+
+def test_a_stale_snapshot_is_rejected() -> None:
+    """F11: a three-hour-old snapshot used to be indistinguishable from a fresh one."""
+    for age in (timedelta(hours=2, seconds=1), timedelta(hours=3), timedelta(days=1)):
+        context = base_context(markets={"SOL": deep_market("SOL", as_of=NOW - age)})
+        verdict = evaluate(make_card(), context)
+        assert (verdict.verdict, verdict.rule_fired) == (
+            "rejected",
+            RULE_STALE_MARKET_DATA,
+        ), age
+
+
+def test_a_snapshot_inside_the_limit_is_fresh() -> None:
+    for age in (timedelta(0), timedelta(minutes=59), timedelta(hours=1, minutes=59)):
+        context = base_context(markets={"SOL": deep_market("SOL", as_of=NOW - age)})
+        verdict = evaluate(make_card(), context)
+        assert verdict.verdict == "approved", (age, verdict.rule_fired)
+
+
+def test_the_raw_snapshot_staleness_flag_is_honoured() -> None:
+    """``RawSnapshotPayload.is_stale`` now reaches the gate instead of stopping at the ledger."""
+    context = base_context(markets={"SOL": deep_market("SOL", is_stale=True)})
+    verdict = evaluate(make_card(), context)
+    assert (verdict.verdict, verdict.rule_fired) == ("rejected", RULE_STALE_MARKET_DATA)
+
+
+def test_a_missing_timestamp_is_not_guessed() -> None:
+    """No ``as_of`` is unknown rather than fresh: the gate refuses staleness it was told about."""
+    verdict = evaluate(make_card(), base_context())
+    assert (verdict.verdict, verdict.rule_fired) == ("approved", None)
+
+
+def test_the_context_can_tighten_the_staleness_limit() -> None:
+    five_minutes_old = {"SOL": deep_market("SOL", as_of=NOW - timedelta(minutes=5))}
+    tight = evaluate(make_card(), base_context(markets=five_minutes_old, market_data_max_age_s=60.0))
+    assert (tight.verdict, tight.rule_fired) == ("rejected", RULE_STALE_MARKET_DATA)
+    loose = evaluate(
+        make_card(),
+        base_context(markets=five_minutes_old, market_data_max_age_s=4 * 60 * 60.0),
+    )
+    assert loose.verdict == "approved"
+
+
+def test_a_stale_snapshot_is_the_first_market_rule() -> None:
+    """An old snapshot is not even a market: staleness is checked before tradability and spread."""
+    context = base_context(
+        markets={
+            "SOL": deep_market(
+                "SOL",
+                as_of=NOW - timedelta(hours=4),
+                volume_24h_usd=1.0,
+                spread_pct=9.0,
+                tradable=False,
+            )
+        }
+    )
+    verdict = evaluate(make_card(), context)
+    assert verdict.rule_fired == RULE_STALE_MARKET_DATA
+
+
+def test_stale_data_does_not_block_a_reduction_or_a_stop() -> None:
+    """Stale market data stops new exposure; it does not trap a position."""
+    stale = {"SOL": deep_market("SOL", is_stale=True)}
+    for action in (Action.TRIM, Action.EXIT, Action.SET_STOP, Action.TRAIL_STOP):
+        verdict = evaluate(make_card(action=action, size_pct=4.0), base_context(markets=stale))
+        assert verdict.verdict == "approved", (action, verdict.rule_fired)

@@ -35,8 +35,11 @@ Book
                             ``funding.free_cash_floor_pct`` is a percent of that sleeve's *target*,
                             so the gate converts it: ``floor_pct_of_book = floor_pct * cap_pct /
                             100`` using the sleeve's ``cap_pct`` from ``config/sleeves.yaml``.
-    ``markets``             per-coin market state: 24h quote volume, spread and whether the pair is
-                            tradable at all. A coin that is absent fails closed (``min_liquidity``).
+    ``markets``             per-coin market state: 24h quote volume, spread, whether the pair is
+                            tradable at all, and how fresh the snapshot is (``as_of``, ``is_stale``).
+                            A coin that is absent fails closed (``min_liquidity``); a snapshot that
+                            missed a whole cadence fails closed (``stale_market_data``). Staleness
+                            stops new exposure only: it never blocks a reduction.
 
 Risk budget used today
     ``daily_turnover_used_pct``, ``daily_loss_used_pct``, ``drawdown_used_pct``,
@@ -132,6 +135,7 @@ RULE_CONFIDENCE_BAND_NO_TRADE = "confidence_band_no_trade"
 RULE_ENTRY_CONFIDENCE = "entry_confidence_below_sleeve_threshold"
 RULE_MISSING_STOP = "missing_stop"
 RULE_POST_ONLY_REQUIRED = "post_only_required"
+RULE_STALE_MARKET_DATA = "stale_market_data"
 RULE_NOT_TRADABLE = "not_tradable"
 RULE_MIN_LIQUIDITY = "min_liquidity"
 RULE_MAX_SPREAD = "max_spread"
@@ -163,6 +167,7 @@ REJECT_RULES: tuple[str, ...] = (
     RULE_ENTRY_CONFIDENCE,
     RULE_MISSING_STOP,
     RULE_POST_ONLY_REQUIRED,
+    RULE_STALE_MARKET_DATA,
     RULE_NOT_TRADABLE,
     RULE_MIN_LIQUIDITY,
     RULE_MAX_SPREAD,
@@ -266,6 +271,12 @@ class MarketContext:
     volume_24h_usd: float = 0.0
     spread_pct: float = 0.0
     tradable: bool = True
+    #: When the snapshot behind these numbers was taken. ``None`` means the caller did not say, and
+    #: the gate will not invent a timestamp: an age it cannot know is not called stale.
+    as_of: datetime | None = None
+    #: The raw snapshot's own staleness flag (``RawSnapshotPayload.is_stale``), carried through so
+    #: the gate sees what the ingest stage already knew.
+    is_stale: bool = False
 
 
 @dataclass(frozen=True)
@@ -278,6 +289,9 @@ class PortfolioContext:
     sleeve_weights_pct: Mapping[Sleeve, float] = field(default_factory=dict)
     free_cash_pct_by_sleeve: Mapping[Sleeve, float] = field(default_factory=dict)
     markets: Mapping[str, MarketContext] = field(default_factory=dict)
+    #: Override for how old a market snapshot may be before the gate refuses to act on it; ``None``
+    #: uses one cadence plus a margin, derived from ``settings.cadence_minutes``.
+    market_data_max_age_s: float | None = None
 
     # Risk budget used today
     daily_turnover_used_pct: float = 0.0
@@ -332,6 +346,49 @@ class PortfolioContext:
 
     def free_cash(self, sleeve: Sleeve) -> float:
         return float(self.free_cash_pct_by_sleeve.get(sleeve, 0.0))
+
+
+# ----------------------------------------------------------------------------------------------
+# Freshness: the gate will not reason about an old snapshot as if it were a new one
+# ----------------------------------------------------------------------------------------------
+
+#: How many decision cadences a market snapshot stays usable for. One cadence plus a full margin: a
+#: snapshot that missed a whole cycle is history, not a market.
+STALE_MARKET_DATA_CADENCES = 2.0
+
+
+def default_market_data_max_age_s() -> float:
+    """``STALE_MARKET_DATA_CADENCES`` x ``settings.cadence_minutes``, in seconds.
+
+    Read from ``config/settings.yaml`` (60 minutes) rather than invented here, so the staleness
+    limit follows the cadence: a faster cadence makes the limit tighter, never looser.
+    """
+    try:
+        minutes = float(load_settings().cadence_minutes)
+    except Exception:  # pragma: no cover - a broken config is a startup failure elsewhere
+        minutes = 60.0
+    return max(1.0, minutes) * 60.0 * STALE_MARKET_DATA_CADENCES
+
+
+def _as_utc(moment: datetime) -> datetime:
+    """A datetime with a timezone, assuming UTC when the caller did not say."""
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+
+def market_data_is_stale(market: MarketContext, *, now: datetime, max_age_s: float) -> bool:
+    """Whether the market state is too old to act on.
+
+    The raw snapshot's own ``is_stale`` flag wins outright. With no ``as_of`` the age is unknown,
+    and the gate reports what it cannot know rather than inventing a timestamp: an entry is refused
+    on staleness the caller actually declared. Phase 0's placeholder loop does not populate it yet;
+    the ingest snapshot carries it, and Phase 2's brief is the caller that passes it in.
+    """
+    if market.is_stale:
+        return True
+    if market.as_of is None:
+        return False
+    age_s = (_as_utc(now) - _as_utc(market.as_of)).total_seconds()
+    return age_s > float(max_age_s)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -442,6 +499,7 @@ class RiskGate:
         self.limits = limits
         self.ledger = ledger
         self.sleeves: Sleeves = load_sleeves()
+        self.max_market_data_age_s = default_market_data_max_age_s()
 
     # -- public API ----------------------------------------------------------------------------
 
@@ -667,6 +725,12 @@ class RiskGate:
         if market is None:
             # No market state means no way to check liquidity or spread: fail closed.
             return RULE_MIN_LIQUIDITY, False, 0.0
+        if market_data_is_stale(
+            market, now=now, max_age_s=self._market_data_max_age_s(context)
+        ):
+            # A snapshot that missed a whole cadence is history, not a market, and good numbers from
+            # an old snapshot are exactly the stale-data attack this rule exists to stop.
+            return RULE_STALE_MARKET_DATA, False, 0.0
         if not market.tradable:
             return RULE_NOT_TRADABLE, False, 0.0
         if market.volume_24h_usd < limits.liquidity.min_24h_volume_usd:
@@ -687,6 +751,12 @@ class RiskGate:
             return RULE_FREE_CASH_FLOOR, True, shortfall
 
         return None
+
+    def _market_data_max_age_s(self, context: PortfolioContext) -> float:
+        """The staleness limit: the context's override, else one cadence plus a margin."""
+        if context.market_data_max_age_s is not None:
+            return max(0.0, float(context.market_data_max_age_s))
+        return self.max_market_data_age_s
 
     def _cooldown_active(self, context: PortfolioContext, now: datetime) -> bool:
         """Two consecutive losses start a cooldown. An unknown ``last_loss_at`` stays active."""
@@ -879,12 +949,14 @@ __all__ = [
     "RULE_POST_ONLY_REQUIRED",
     "RULE_SLEEVE_CAP",
     "RULE_SLEEVE_DISABLED",
+    "RULE_STALE_MARKET_DATA",
     "RULE_UNSUPPORTED_ACTION",
     "RULE_VENUE_STATUS",
     "RULE_WEEKLY_DRAWDOWN_HALT",
     "RiskGate",
     "SELL_ACTIONS",
     "SHRINK_RULES",
+    "STALE_MARKET_DATA_CADENCES",
     "STOP_MANAGEMENT_ACTIONS",
     "UNRESOLVED_OBJECTION_SEVERITY",
     "VENUE_STATUSES",
@@ -892,6 +964,8 @@ __all__ = [
     "VERDICT_APPROVED",
     "VERDICT_REJECTED",
     "VERDICT_SHRUNK",
+    "default_market_data_max_age_s",
+    "market_data_is_stale",
     "objection_severity",
     "ontario_net_buys_cad_12m",
 ]
