@@ -85,8 +85,21 @@ class SignalStoreError(RuntimeError):
 #: How many post-only slices a laddered entry uses by default (plan: two or three).
 DEFAULT_LADDER_SLICES = 3
 
+#: Ladder offsets below the reference price for a buy (above it for a sell), in percent. Published in
+#: the execution intent and consumed by the bridge, so each slice of a ladder sits at its own price
+#: instead of three slices landing on one price.
+LADDER_OFFSETS_PCT: tuple[float, ...] = (0.10, 0.25, 0.40)
+
 #: Hard time stop for an event trade, in minutes (plan: event trades carry one).
 EVENT_TIME_STOP_MINUTES = 24 * 60
+
+#: The default take-profit ladder, in freqtrade's minimal-ROI form: minutes after entry -> ratio.
+#: Published in the execution intent so the bridge can act on a take-profit ladder without the
+#: pipeline having to invent a target price for a card that carries none.
+MINIMAL_ROI_LADDER: dict[str, float] = {"0": 0.04, "30": 0.02, "60": 0.01, "120": 0.0}
+
+#: Fractions of the position a take-profit ladder takes off, largest first.
+PARTIAL_EXIT_STEPS: tuple[float, ...] = (0.5, 0.25)
 
 #: Actions that open or increase exposure: they always enter post-only.
 ENTRY_ACTIONS: frozenset[Action] = frozenset({Action.ENTER_LADDERED, Action.ADD, Action.EVENT_TRADE})
@@ -120,8 +133,14 @@ def execution_intent(card: DecisionCard, verdict: RiskGateVerdict) -> dict[str, 
         "size_pct": float(verdict.final_size_pct) if approved else 0.0,
         "original_size_pct": float(verdict.original_size_pct),
         "ladder_slices": slices,
+        "ladder_offsets_pct": list(LADDER_OFFSETS_PCT) if action in ENTRY_ACTIONS else [],
         "stop_price": None,
         "target_price": None,
+        # A take-profit ladder is published as the ladder itself, not as a price: the card carries no
+        # target, and with ``target_price`` null the bridge had nothing to fire on and the action was
+        # silently dead.
+        "minimal_roi": dict(MINIMAL_ROI_LADDER) if action == Action.TAKE_PROFIT_LADDER else {},
+        "partial_exits": list(PARTIAL_EXIT_STEPS) if action == Action.TAKE_PROFIT_LADDER else [],
         "time_stop_minutes": EVENT_TIME_STOP_MINUTES if action == Action.EVENT_TRADE else None,
         "post_only": order_type == "post_only_limit",
         "rule_fired": verdict.rule_fired,

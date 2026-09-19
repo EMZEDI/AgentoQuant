@@ -56,6 +56,38 @@ SIGNAL_MAX_AGE_SECONDS = 75 * 60
 SIGNAL_DIR_ENV = "AGENTOQUANT_SIGNAL_DIR"
 
 
+def roi_step(ladder: dict, trade, current_time) -> float | None:
+    """The minimal-ROI ratio that applies to ``trade`` now, or ``None`` when the ladder is empty.
+
+    The ladder is freqtrade's minimal-ROI form: minutes after entry -> the profit ratio the trade
+    must reach from that point on. The applicable step is the one with the largest threshold the
+    trade's age has passed, exactly as freqtrade's own ``min_roi_reached`` reads it.
+    """
+    if not ladder:
+        return None
+    opened = getattr(trade, "open_date_utc", None)
+    if opened is None:
+        return None
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=UTC)
+    moment = current_time
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    age_minutes = (moment - opened).total_seconds() / 60.0
+    steps = []
+    for minutes, ratio in ladder.items():
+        try:
+            steps.append((float(minutes), float(ratio)))
+        except (TypeError, ValueError):
+            continue
+    if not steps:
+        return None
+    applicable = [ratio for minutes, ratio in sorted(steps) if age_minutes >= minutes]
+    if not applicable:
+        return None
+    return applicable[-1]
+
+
 class AgentBridgeStrategy(IStrategy):
     """Reads the published signal document and executes it in dry-run."""
 
@@ -436,6 +468,22 @@ class AgentBridgeStrategy(IStrategy):
             target = execution.get("target_price")
             if target and float(current_rate) >= float(target):
                 self._ack(document, {"action": "take_profit", "pair": pair, "rate": current_rate})
+                return "take_profit_ladder"
+            # No target price: the pipeline publishes the ladder itself (minimal-ROI form, minutes
+            # after entry -> ratio). Without this the branch could never fire, because a card carries
+            # no target price and ``target_price`` was always null.
+            step = roi_step(execution.get("minimal_roi") or {}, trade, current_time)
+            if step is not None and float(current_profit or 0.0) >= step:
+                self._ack(
+                    document,
+                    {
+                        "action": "take_profit_ladder",
+                        "pair": pair,
+                        "step": step,
+                        "current_profit": current_profit,
+                        "rate": current_rate,
+                    },
+                )
                 return "take_profit_ladder"
 
         if action == "exit" and document.get("pair") == pair:

@@ -42,6 +42,9 @@ from agentoquant.enums import REJECTED_ACTIONS, Action, Stage
 from agentoquant.execution.signal_store import (
     DEFAULT_LADDER_SLICES,
     EVENT_TIME_STOP_MINUTES,
+    LADDER_OFFSETS_PCT,
+    MINIMAL_ROI_LADDER,
+    PARTIAL_EXIT_STEPS,
     pair_for,
 )
 from agentoquant.ledger.schema import DecisionCard, ExecutionPayload, RiskGateVerdict
@@ -104,7 +107,9 @@ PURPOSE_NONE = "none"
 
 #: Ladder offsets below the reference price for a buy (above it for a sell), in percent. Post-only
 #: orders sit on the maker side by construction, which is what keeps the entry at Tier 1 maker fees.
-LADDER_OFFSETS_PCT: tuple[float, ...] = (0.10, 0.25, 0.40)
+#: Defined in ``signal_store`` because the bridge strategy consumes the same offsets; re-exported here
+#: for the order-manager callers that have always imported it from this module.
+LADDER_OFFSETS_PCT: tuple[float, ...] = LADDER_OFFSETS_PCT
 
 #: Time in minutes an unfilled entry or exit waits before it is repriced or cancelled.
 UNFILLED_TIMEOUT_MINUTES = 10
@@ -114,10 +119,10 @@ REBALANCE_WEEKDAY = 6
 REBALANCE_HOUR = 0
 
 #: The default take-profit ladder, in freqtrade's minimal-ROI form: minutes after entry -> ratio.
-DEFAULT_MINIMAL_ROI: dict[str, float] = {"0": 0.04, "30": 0.02, "60": 0.01, "120": 0.0}
+DEFAULT_MINIMAL_ROI: dict[str, float] = dict(MINIMAL_ROI_LADDER)
 
 #: Fractions of the position a take-profit ladder takes off, largest first.
-PARTIAL_EXIT_FRACTIONS: tuple[float, ...] = (0.5, 0.25)
+PARTIAL_EXIT_FRACTIONS: tuple[float, ...] = PARTIAL_EXIT_STEPS
 
 #: The venue the addendum's ``execution`` payload records for Kraken spot.
 VENUE_KRAKEN = "kraken"
