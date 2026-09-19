@@ -72,6 +72,12 @@ class AgentBridgeStrategy(IStrategy):
     use_exit_signal = True
     startup_candle_count = 20
 
+    #: Laddered entries, DCA adds and partial exits all run through ``adjust_trade_position``, which
+    #: freqtrade only calls when position adjustment is switched on (config
+    #: ``position_adjustment_enable``) and this cap is non-zero. With the default 0 those three
+    #: paths exist in the order manager's map but can never execute.
+    max_entry_position_adjustment = 3
+
     #: Post-only entries. Stops are the only orders allowed to be taker orders.
     order_types = {
         "entry": "limit",

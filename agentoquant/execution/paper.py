@@ -412,7 +412,23 @@ def main(cycle_id: str | None = None, placeholder: bool = False, hours: int = 1)
     """``agentoquant paper``. Runs the hourly loop in paper mode and returns a CLI-shaped result.
 
     Dry-run only. The command never prompts, never needs a terminal and never places a real order.
+
+    Without ``--placeholder`` there is no decision source to run: Phase 0 ships only the placeholder
+    source and Phase 2 adds the agent cascade. That case reports ``not_implemented`` (the CLI's exit
+    code 3) and names the flag that does work, rather than reporting an empty cycle as a success.
     """
+    if not placeholder:
+        return {
+            "message": (
+                "not implemented yet (owned by Phase 2): the decision cascade behind `agentoquant "
+                "paper`. Phase 0 runs the same loop with a placeholder decision source: "
+                "`agentoquant paper --placeholder --hours 1`."
+            ),
+            "status": "not_implemented",
+            "command": "paper",
+            "placeholder_available": True,
+            "usage": "agentoquant paper --placeholder --hours 1",
+        }
     result = run_loop(hours=hours, placeholder=placeholder, cycle_id=cycle_id, sleep=True)
     completed, failed = int(result["completed"]), int(result["failed"])
     message = (

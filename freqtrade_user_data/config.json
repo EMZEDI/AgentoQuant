@@ -1,104 +1,106 @@
 {
-    "$schema": "https://schema.freqtrade.io/schema.json",
-    "bot_name": "agentoquant-paper",
-    "initial_state": "running",
-    "dry_run": true,
-    "dry_run_wallet": 900,
-    "trading_mode": "spot",
-    "margin_mode": "",
-    "cancel_open_orders_on_exit": true,
-    "stake_currency": "USD",
-    "stake_amount": "unlimited",
-    "tradable_balance_ratio": 0.95,
-    "fiat_display_currency": "CAD",
-    "max_open_trades": 3,
-    "timeframe": "5m",
-    "minimal_roi": {
-        "0": 0.04,
-        "30": 0.02,
-        "60": 0.01,
-        "120": 0.0
-    },
-    "stoploss": -0.05,
-    "trailing_stop": false,
-    "trailing_stop_positive": 0.02,
-    "trailing_stop_positive_offset": 0.03,
-    "trailing_only_offset_is_reached": true,
-    "unfilledtimeout": {
-        "entry": 10,
-        "exit": 10,
-        "exit_timeout_count": 0,
-        "unit": "minutes"
-    },
-    "entry_pricing": {
-        "price_side": "other",
-        "use_order_book": true,
-        "order_book_top": 1,
-        "price_last_balance": 0.0,
-        "check_depth_of_market": {
-            "enabled": false,
-            "bids_to_ask_delta": 1
-        }
-    },
-    "exit_pricing": {
-        "price_side": "other",
-        "use_order_book": true,
-        "order_book_top": 1
-    },
-    "order_types": {
-        "entry": "limit",
-        "exit": "limit",
-        "emergency_exit": "market",
-        "force_entry": "limit",
-        "force_exit": "limit",
-        "stoploss": "market",
-        "stoploss_on_exchange": true,
-        "stoploss_on_exchange_interval": 60,
-        "stoploss_on_exchange_limit_ratio": 0.99
-    },
-    "exchange": {
-        "name": "kraken",
-        "key": "",
-        "secret": "",
-        "ccxt_config": {},
-        "ccxt_async_config": {},
-        "pair_whitelist": [
-            "BTC/USD",
-            "ETH/USD",
-            "SOL/USD"
-        ],
-        "pair_blacklist": []
-    },
-    "pairlists": [
-        {
-            "method": "StaticPairList"
-        }
+  "$schema": "https://schema.freqtrade.io/schema.json",
+  "bot_name": "agentoquant-paper",
+  "initial_state": "running",
+  "dry_run": true,
+  "dry_run_wallet": 900,
+  "trading_mode": "spot",
+  "margin_mode": "",
+  "cancel_open_orders_on_exit": true,
+  "stake_currency": "USD",
+  "stake_amount": "unlimited",
+  "tradable_balance_ratio": 0.95,
+  "fiat_display_currency": "CAD",
+  "max_open_trades": 3,
+  "position_adjustment_enable": true,
+  "force_entry_enable": true,
+  "timeframe": "5m",
+  "minimal_roi": {
+    "0": 0.04,
+    "30": 0.02,
+    "60": 0.01,
+    "120": 0.0
+  },
+  "stoploss": -0.05,
+  "trailing_stop": false,
+  "trailing_stop_positive": 0.02,
+  "trailing_stop_positive_offset": 0.03,
+  "trailing_only_offset_is_reached": true,
+  "unfilledtimeout": {
+    "entry": 10,
+    "exit": 10,
+    "exit_timeout_count": 0,
+    "unit": "minutes"
+  },
+  "entry_pricing": {
+    "price_side": "other",
+    "use_order_book": true,
+    "order_book_top": 1,
+    "price_last_balance": 0.0,
+    "check_depth_of_market": {
+      "enabled": false,
+      "bids_to_ask_delta": 1
+    }
+  },
+  "exit_pricing": {
+    "price_side": "other",
+    "use_order_book": true,
+    "order_book_top": 1
+  },
+  "order_types": {
+    "entry": "limit",
+    "exit": "limit",
+    "emergency_exit": "market",
+    "force_entry": "limit",
+    "force_exit": "limit",
+    "stoploss": "market",
+    "stoploss_on_exchange": true,
+    "stoploss_on_exchange_interval": 60,
+    "stoploss_on_exchange_limit_ratio": 0.99
+  },
+  "exchange": {
+    "name": "kraken",
+    "key": "",
+    "secret": "",
+    "ccxt_config": {},
+    "ccxt_async_config": {},
+    "pair_whitelist": [
+      "BTC/USD",
+      "ETH/USD",
+      "SOL/USD"
     ],
-    "api_server": {
-        "enabled": false,
-        "listen_ip_address": "127.0.0.1",
-        "listen_port": 8080,
-        "verbosity": "error",
-        "enable_openapi": false,
-        "jwt_secret_key": "agentoquant-local-dry-run-jwt-signing-key",
-        "ws_token": "",
-        "CORS_origins": [],
-        "username": "agentoquant",
-        "password": ""
-    },
-    "telegram": {
-        "enabled": false,
-        "token": "",
-        "chat_id": ""
-    },
-    "strategy": "AgentBridgeStrategy",
-    "user_data_dir": "freqtrade_user_data",
-    "db_url": "sqlite:///freqtrade_user_data/agentoquant-paper.sqlite",
-    "logfile": "freqtrade_user_data/logs/freqtrade.log",
-    "internals": {
-        "process_throttle_secs": 5
-    },
-    "agent_signal_dir": "data/signals",
-    "agent_trail_percent": 5.0,
-    "agent_trim_fraction": 0.5
+    "pair_blacklist": []
+  },
+  "pairlists": [
+    {
+      "method": "StaticPairList"
+    }
+  ],
+  "api_server": {
+    "enabled": false,
+    "listen_ip_address": "127.0.0.1",
+    "listen_port": 8080,
+    "verbosity": "error",
+    "enable_openapi": false,
+    "jwt_secret_key": "agentoquant-local-dry-run-jwt-signing-key",
+    "ws_token": "",
+    "CORS_origins": [],
+    "username": "agentoquant",
+    "password": ""
+  },
+  "telegram": {
+    "enabled": false,
+    "token": "",
+    "chat_id": ""
+  },
+  "strategy": "AgentBridgeStrategy",
+  "user_data_dir": "freqtrade_user_data",
+  "db_url": "sqlite:///freqtrade_user_data/agentoquant-paper.sqlite",
+  "logfile": "freqtrade_user_data/logs/freqtrade.log",
+  "internals": {
+    "process_throttle_secs": 5
+  },
+  "agent_signal_dir": "data/signals",
+  "agent_trail_percent": 5.0,
+  "agent_trim_fraction": 0.5
 }
