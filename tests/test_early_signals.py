@@ -12,8 +12,25 @@ Task 4 verification steps:
   - one week of listener uptime with restarts logged
 
 Every test here is offline. HTTP goes through a local recording transport that replays canned
-bodies (``RecordingTransport``); ledger writes go to a DuckDB file under ``tmp_path``. Nothing
-places an order, moves funds, or speaks MTProto - the listeners are read-only by construction.
+bodies (``RecordingTransport``) or through a canned stub fetcher (``StubFetcher``); ledger writes go
+to a DuckDB file under ``tmp_path``. Nothing places an order, moves funds, or speaks MTProto - the
+listeners are read-only by construction. The only socket opened anywhere in this file is a loopback
+one, by the test that serves the webhook receiver on ``127.0.0.1`` with a port the OS picks.
+
+Coverage map (one section per module under ``agentoquant/data/early_signals/``):
+
+* ``__init__.py``      - SignalEvent validation, ticker extraction, RateLimiter, HttpFetcher,
+                         SignalWriter (dedupe + ledger write path), JsonlLog, ListenerStats, Listener
+* ``bybit_listings``   - the pre-existing parser/listener tests, kept
+* ``okx_listings``     - parser, malformed bodies, per-type poll, non-zero code
+* ``kraken_listings``  - RSS parsing and failure, AssetPairs diffing, baseline-on-first-run, state file
+* ``github_releases``  - parser, drafts/prereleases, per-repo failure isolation, token header
+* ``google_news_rss``  - parser, per-ticker feeds, dedupe, article-time helpers
+* ``telegram_previews``- ``t.me/s`` parsing, event classification, no-preview and failure paths
+* ``onchain_webhooks`` - signatures, registry, Alchemy/Helius payloads, attribution, block lag,
+                         the loopback server
+* ``runner``           - build_listeners, Runner lifecycle, restart backoff, status/heartbeat,
+                         fixture replay
 
 GAP, REPORTED NOT HIDDEN: the on-chain receiver measures and returns a per-event block lag but
 nothing enforces the "within two blocks" bound, and the frozen ``EarlySignalPayload`` has no
@@ -23,7 +40,9 @@ block column (the block number lives inside ``raw_text_or_ref``). See
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+import json
+import threading
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -31,13 +50,22 @@ import httpx
 import pytest
 
 from agentoquant.data.early_signals import (
+    EVENT_TYPES,
+    FetchError,
     HttpFetcher,
     JsonlLog,
+    Listener,
+    RateLimiter,
+    SignalEvent,
     SignalWriter,
-    bybit_listings,
+    as_utc,
+    extract_tickers,
+    listener_cycle_id,
+    single_ticker,
 )
-from agentoquant.enums import SourceClass
-from agentoquant.ledger.store import LedgerStore
+from agentoquant.enums import SourceClass, Stage
+from agentoquant.ledger.schema import EarlySignalPayload
+from agentoquant.ledger.store import DB_PATH_ENV, LedgerStore
 
 # ----------------------------------------------------------------------------------------------
 # Offline HTTP: a recording transport plus a fetcher that can only reach it
@@ -80,7 +108,79 @@ class RecordingTransport(httpx.BaseTransport):
         return [dict(request.url.params) for request in self.requests]
 
 
-def make_fetcher(transport: RecordingTransport, *, base_url: str = "", **kwargs: Any) -> HttpFetcher:
+class SequencedTransport(httpx.BaseTransport):
+    """Replays a queue of responses in order, then repeats the last one. For retry/backoff tests.
+
+    Each item is ``(status, body)`` (like :class:`RecordingTransport`), a ready-made
+    :class:`httpx.Response`, or an exception instance to raise as a transport error.
+    """
+
+    def __init__(self, *responses: Any) -> None:
+        self.responses: list[Any] = list(responses)
+        self.requests: list[httpx.Request] = []
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        item = self.responses[min(len(self.requests) - 1, len(self.responses) - 1)]
+        if isinstance(item, Exception):
+            raise item
+        if isinstance(item, httpx.Response):
+            return item
+        status, body = item
+        if isinstance(body, str):
+            return httpx.Response(status, text=body)
+        if isinstance(body, bytes):
+            return httpx.Response(status, content=body)
+        return httpx.Response(status, json=body)
+
+
+class StubFetcher:
+    """A stand-in for :class:`HttpFetcher` with canned per-URL/per-query answers.
+
+    Used where a test needs a *specific* request to fail (one repo, one ticker, one channel) - the
+    path-keyed transports cannot express that. Raising :class:`FetchError` is what the real fetcher
+    does for a permanent HTTP error, so the listeners' failure branches are exercised for real.
+    """
+
+    def __init__(
+        self,
+        *,
+        texts: dict[str, str] | None = None,
+        jsons: dict[str, Any] | None = None,
+        default_text: str | None = None,
+        default_json: Any = None,
+    ) -> None:
+        self.texts = dict(texts or {})
+        self.jsons = dict(jsons or {})
+        self.default_text = default_text
+        self.default_json = default_json
+        self.calls: list[tuple[str, str, dict[str, str]]] = []
+        self.closed = False
+
+    def get_text(self, path_or_url: str, *, params: dict[str, Any] | None = None) -> str:
+        params = dict(params or {})
+        self.calls.append(("text", path_or_url, params))
+        key = params.get("q") or path_or_url
+        if key in self.texts:
+            return self.texts[key]
+        if self.default_text is not None:
+            return self.default_text
+        raise FetchError(f"GET {path_or_url} -> HTTP 404 (no canned text)")
+
+    def get_json(self, path_or_url: str, *, params: dict[str, Any] | None = None) -> Any:
+        params = dict(params or {})
+        self.calls.append(("json", path_or_url, params))
+        if path_or_url in self.jsons:
+            return self.jsons[path_or_url]
+        if self.default_json is not None:
+            return self.default_json
+        raise FetchError(f"GET {path_or_url} -> HTTP 404 (no canned json)")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def make_fetcher(transport: RecordingTransport | SequencedTransport, *, base_url: str = "", **kwargs: Any) -> HttpFetcher:
     """An :class:`HttpFetcher` whose only client is the canned transport."""
     return HttpFetcher(
         base_url=base_url,
@@ -92,9 +192,70 @@ def make_fetcher(transport: RecordingTransport, *, base_url: str = "", **kwargs:
     )
 
 
+class FakeMonotonic:
+    """A controllable ``time.monotonic`` for the rate limiter and backoff tests."""
+
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = float(start)
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += float(seconds)
+
+
+class RecordingSleep:
+    """A stand-in for ``time.sleep`` that records the delays instead of waiting."""
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.delays.append(float(seconds))
+
+
+class StopAfterSleeps:
+    """A ``sleep`` stand-in that sets the stop event after N calls: drives a listener loop in tests."""
+
+    def __init__(self, stop_event: threading.Event, after: int) -> None:
+        self.stop_event = stop_event
+        self.after = after
+        self.calls = 0
+        self.delays: list[float] = []
+
+    def __call__(self, seconds: float) -> None:
+        self.delays.append(float(seconds))
+        self.calls += 1
+        if self.calls >= self.after:
+            self.stop_event.set()
+
+
+class CountingLimiter:
+    """Stands in for :class:`RateLimiter` and counts ``acquire`` calls."""
+
+    def __init__(self) -> None:
+        self.acquires = 0
+
+    def acquire(self) -> None:
+        self.acquires += 1
+
+
 # ----------------------------------------------------------------------------------------------
 # Ledger helpers
 # ----------------------------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def scratch_ledger_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point the *default* ledger path at ``tmp_path``, so no test can reach ``data/ledger.duckdb``.
+
+    Autouse on purpose: any listener, runner or ``SignalWriter()`` built without an explicit store
+    resolves its path through ``AGENTOQUANT_LEDGER_PATH``, and it must resolve to a scratch file.
+    """
+    path = tmp_path / "env-ledger.duckdb"
+    monkeypatch.setenv(DB_PATH_ENV, str(path))
+    return path
 
 
 @pytest.fixture
@@ -138,121 +299,350 @@ def log_events(log: JsonlLog, name: str | None = None) -> list[dict]:
     return [record for record in records if name is None or record.get("event") == name]
 
 
+def early_signal_columns(store: LedgerStore) -> set[str]:
+    """The physical column names of the ``early_signal`` table."""
+    return {name for name, _kind in store.table_columns(Stage.EARLY_SIGNAL)}
+
+
+def make_event(**overrides: Any) -> SignalEvent:
+    """A minimal valid event, with any field overridden per test."""
+    fields: dict[str, Any] = {
+        "source_class": SourceClass.HEADLINE,
+        "event_type": "headline",
+        "raw_text_or_ref": "https://news.example.invalid/article-1",
+        "detected_at": datetime(2026, 9, 16, 12, 0, tzinfo=UTC),
+        "ticker": "PENGU",
+        "source": "test",
+    }
+    fields.update(overrides)
+    return SignalEvent(**fields)
+
+
+class StubListener(Listener):
+    """A :class:`Listener` whose ``poll`` returns canned events or raises a canned error."""
+
+    name = "stub_listener"
+    source_class = SourceClass.HEADLINE
+    interval_seconds = 30.0
+
+    def __init__(
+        self,
+        writer: SignalWriter,
+        *,
+        events: Any = (),
+        error: BaseException | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(writer, **kwargs)
+        self._events = list(events)
+        self._error = error
+
+    def poll(self) -> list[SignalEvent]:
+        if self._error is not None:
+            raise self._error
+        return list(self._events)
+
+
 # ----------------------------------------------------------------------------------------------
-# Exchange listing announcements: Bybit and OKX
+# Shared core: SignalEvent, ticker extraction, timestamps
 # ----------------------------------------------------------------------------------------------
 
-BYBIT_LISTING_MS = 1_789_000_000_000  # 2026-09-16T12:26:40Z
-BYBIT_PUBLISHED_AT = datetime.fromtimestamp(BYBIT_LISTING_MS / 1000, tz=UTC)
-BYBIT_OBSERVED_AT = BYBIT_PUBLISHED_AT + timedelta(seconds=25)
 
-BYBIT_BODY: dict[str, Any] = {
-    "retCode": 0,
-    "retMsg": "OK",
-    "result": {
-        "list": [
-            {
-                "type": {"key": "new_crypto", "title": "New Crypto"},
-                "title": "Bybit will list PENGU (PENGU) for spot trading",
-                "url": "https://announcements.bybit.com/en-US/article/listing-pengu",
-                "publishTime": BYBIT_LISTING_MS,
-            },
-            {
-                "type": {"key": "delistings", "title": "Delistings"},
-                "title": "Bybit will delist XYZUSDT perpetual",
-                "url": "https://announcements.bybit.com/en-US/article/delist-xyz",
-                "publishTime": BYBIT_LISTING_MS + 1000,
-            },
-            {
-                "type": {"key": "product_updates", "title": "Product updates"},
-                "title": "Bybit margin tier update",
-                "url": "https://announcements.bybit.com/en-US/article/margin",
-                "publishTime": BYBIT_LISTING_MS + 2000,
-            },
-        ]
-    },
-}
+def test_event_type_vocabulary_matches_the_addendum() -> None:
+    """``event_type`` is a frozen vocabulary; a listener cannot invent a seventh kind."""
+    assert set(EVENT_TYPES) == {
+        "listing",
+        "unlock",
+        "large_transfer",
+        "release",
+        "headline",
+        "policy",
+    }
 
 
-def test_bybit_new_listing_is_an_exchange_announcement_with_a_ticker() -> None:
-    events = bybit_listings.parse_bybit_announcements(BYBIT_BODY, observed_at=BYBIT_OBSERVED_AT)
-    listings = [event for event in events if event.event_type == "listing"]
-    assert len(listings) == 1
-    event = listings[0]
-    assert event.source_class is SourceClass.EXCHANGE_ANNOUNCEMENT
-    assert event.ticker == "PENGU"
-    assert event.raw_text_or_ref.endswith("listing-pengu")
-    assert event.detected_at == BYBIT_PUBLISHED_AT
-    assert event.published_at == BYBIT_PUBLISHED_AT
-    assert event.source == "bybit_listings"
-    assert event.block_number is None
+def test_signal_event_rejects_a_non_source_class() -> None:
+    """The Verifier's ranking key is required and typed, never a bare string."""
+    with pytest.raises(TypeError):
+        make_event(source_class="headline")
 
 
-def test_bybit_delisting_is_policy_and_other_types_are_ignored() -> None:
-    events = bybit_listings.parse_bybit_announcements(BYBIT_BODY, observed_at=BYBIT_OBSERVED_AT)
-    policies = [event for event in events if event.event_type == "policy"]
-    assert len(policies) == 1
-    assert policies[0].ticker == "XYZ"
-    assert all("margin" not in event.raw_text_or_ref for event in events)
+def test_signal_event_rejects_an_event_type_outside_the_vocabulary() -> None:
+    with pytest.raises(ValueError, match="outside the ledger vocabulary"):
+        make_event(event_type="delisting")
+
+
+def test_signal_event_rejects_a_blank_reference() -> None:
+    with pytest.raises(ValueError, match="raw_text_or_ref"):
+        make_event(raw_text_or_ref="   ")
+
+
+def test_signal_event_coerces_naive_timestamps_to_utc() -> None:
+    naive = datetime(2026, 9, 16, 12, 0)
+    event = make_event(detected_at=naive, observed_at=naive, published_at=naive)
+    assert event.detected_at == datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
+    assert event.observed_at.tzinfo is UTC
+    assert event.published_at.tzinfo is UTC
+    assert event.first_article_at is None
+
+
+def test_signal_event_dedupe_key_is_class_and_reference() -> None:
+    event = make_event(source_class=SourceClass.ONCHAIN, raw_text_or_ref="helius:SOLANA:1 tx")
+    assert event.dedupe_key == ("onchain", "helius:SOLANA:1 tx")
+    assert event.ref == event.raw_text_or_ref
+
+
+def test_signal_event_latency_vs_first_article() -> None:
+    announcement = datetime(2026, 9, 16, 12, 0, tzinfo=UTC)
+    assert make_event(detected_at=announcement).latency_vs_first_article() is None
+    ahead = make_event(
+        detected_at=announcement, first_article_at=announcement + timedelta(minutes=45)
+    )
+    assert ahead.latency_vs_first_article() == 2700
+    behind = make_event(
+        detected_at=announcement, first_article_at=announcement - timedelta(seconds=30)
+    )
+    assert behind.latency_vs_first_article() == -30
+
+
+def test_signal_event_payload_is_the_frozen_early_signal_payload() -> None:
+    event = make_event(
+        source_class=SourceClass.EXCHANGE_ANNOUNCEMENT,
+        event_type="listing",
+        first_article_at=datetime(2026, 9, 16, 13, 0, tzinfo=UTC),
+    )
+    payload = event.payload()
+    assert isinstance(payload, EarlySignalPayload)
+    assert payload.source_class is SourceClass.EXCHANGE_ANNOUNCEMENT
+    assert payload.ticker == "PENGU"
+    assert payload.event_type == "listing"
+    assert payload.raw_text_or_ref == event.raw_text_or_ref
+    assert payload.detected_at == event.detected_at
+    assert payload.latency_seconds_vs_first_article == 3600
+
+
+def test_signal_event_log_fields_are_json_safe() -> None:
+    event = make_event(block_number=21_000_001)
+    fields = event.log_fields()
+    assert json.loads(json.dumps(fields)) == fields
+    assert fields["block_number"] == 21_000_001
+    assert fields["source_class"] == "headline"
+    assert fields["observed_at"] == event.detected_at.isoformat()
 
 
 @pytest.mark.parametrize(
-    "payload",
+    ("text", "expected"),
     [
-        None,
-        [],
-        "not-a-mapping",
-        {},
-        {"retCode": 10001, "retMsg": "params error", "result": {}},
-        {"retCode": 0, "result": {"list": []}},
-        {"retCode": 0, "result": {"list": ["not-a-dict", {"type": "not-a-dict"}]}},
-        {"retCode": 0, "result": {"list": [{"type": {"key": "new_crypto"}, "title": "", "url": ""}]}},
+        ("Bybit will list PENGU (PENGU) for spot trading", ["PENGU"]),
+        ("OKX to list SLX/USDT (Solstice) for spot trading", ["SLX"]),
+        ("Bybit will delist XYZUSDT perpetual", ["XYZ"]),
+        ("TREAD is available for trading!", ["TREAD"]),
+        ("FOO is now available for trading", ["FOO"]),
+        ("Kraken new listing: BAR", ["BAR"]),
+        ("Binance will launch BAZ", ["BAZ"]),
+        ("OKX to list AAA/USDT and BBB/USDT", ["AAA", "BBB"]),
     ],
 )
-def test_bybit_malformed_and_empty_bodies_yield_no_events(payload: Any) -> None:
-    assert bybit_listings.parse_bybit_announcements(payload, observed_at=BYBIT_OBSERVED_AT) == []
+def test_extract_tickers_recognises_the_announcement_shapes(text: str, expected: list[str]) -> None:
+    assert extract_tickers(text) == expected
 
 
-def test_bybit_listener_poll_once_writes_both_events_to_the_ledger(
-    writer: SignalWriter, log: JsonlLog
-) -> None:
-    transport = RecordingTransport().add(
-        bybit_listings.ANNOUNCEMENTS_PATH, 200, BYBIT_BODY
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Bybit will list NEW tokens",
+        "Trading fee update for all pairs",
+        "OKX to list 13 new tokens in EUR and USD",
+        "",
+    ],
+)
+def test_extract_tickers_drops_stopwords_and_numeric_noise(text: str) -> None:
+    assert extract_tickers(text) == []
+
+
+def test_single_ticker_is_none_when_several_symbols_are_named() -> None:
+    """An announcement naming several tokens is recorded unattributed, not guessed."""
+    assert single_ticker("OKX to list AAA/USDT and BBB/USDT") is None
+    assert single_ticker("TREAD is available for trading!") == "TREAD"
+
+
+def test_listener_cycle_id_groups_signals_by_hour() -> None:
+    assert listener_cycle_id(datetime(2026, 9, 19, 3, 45, tzinfo=UTC)) == "2026-09-19T03Z-listen"
+    assert listener_cycle_id(datetime(2026, 9, 19, 3, 45)) == "2026-09-19T03Z-listen"
+
+
+def test_as_utc_treats_a_naive_value_as_utc() -> None:
+    assert as_utc(datetime(2026, 9, 19, 3, 0)) == datetime(2026, 9, 19, 3, 0, tzinfo=UTC)
+    assert as_utc(datetime(2026, 9, 19, 5, 0, tzinfo=timezone_plus_two())).hour == 3
+
+
+def timezone_plus_two() -> Any:
+    """A fixed +02:00 tzinfo, without pulling in ``zoneinfo`` (no tzdata dependency in tests)."""
+    return timezone(timedelta(hours=2))
+
+
+# ----------------------------------------------------------------------------------------------
+# Shared core: RateLimiter
+# ----------------------------------------------------------------------------------------------
+
+
+def test_rate_limiter_waits_between_calls() -> None:
+    clock = FakeMonotonic()
+    slept = RecordingSleep()
+    limiter = RateLimiter(2.0, clock=clock, sleep=lambda seconds: (slept(seconds), clock.advance(seconds)))
+
+    limiter.acquire()
+    assert slept.delays == []  # the first call never waits
+    limiter.acquire()
+    assert slept.delays == [2.0]
+    limiter.acquire()
+    assert slept.delays == [2.0, 2.0]
+
+
+def test_rate_limiter_clamps_a_negative_interval() -> None:
+    slept = RecordingSleep()
+    limiter = RateLimiter(-5.0, clock=FakeMonotonic(), sleep=slept)
+    assert limiter.min_interval_seconds == 0.0
+    limiter.acquire()
+    limiter.acquire()
+    assert slept.delays == []
+
+
+# ----------------------------------------------------------------------------------------------
+# Shared core: HttpFetcher (retries, backoff, rate limiting)
+# ----------------------------------------------------------------------------------------------
+
+
+def test_fetcher_retries_a_transient_status_then_succeeds() -> None:
+    transport = SequencedTransport((503, {"error": "unavailable"}), (200, {"ok": True}))
+    slept = RecordingSleep()
+    fetcher = HttpFetcher(
+        base_url="https://source.example.invalid",
+        client=httpx.Client(transport=transport),
+        max_retries=3,
+        sleep=slept,
     )
-    listener = bybit_listings.BybitListingsListener(
-        writer,
-        fetcher=make_fetcher(transport, base_url=bybit_listings.BASE_URL),
-        log=log,
-        clock=lambda: BYBIT_OBSERVED_AT,
+    assert fetcher.get_json("/v1/thing") == {"ok": True}
+    assert len(transport.requests) == 2
+    assert 1.0 <= slept.delays[0] <= 1.1
+
+
+def test_fetcher_honours_retry_after() -> None:
+    throttled = httpx.Response(429, headers={"retry-after": "7"}, json={"error": "slow down"})
+    transport = SequencedTransport(throttled, (200, {"ok": True}))
+    slept = RecordingSleep()
+    fetcher = HttpFetcher(
+        base_url="https://source.example.invalid",
+        client=httpx.Client(transport=transport),
+        max_retries=2,
+        sleep=slept,
     )
-    written = listener.poll_once()
-
-    assert len(written) == 2
-    assert transport.paths == [bybit_listings.ANNOUNCEMENTS_PATH]
-    assert transport.query_params[0]["locale"] == "en-US"
-    rows = signal_rows(writer.store)
-    assert {row["event_type"] for row in rows} == {"listing", "policy"}
-    assert {row["source_class"] for row in rows} == {SourceClass.EXCHANGE_ANNOUNCEMENT.value}
-    assert {row["producer_role"] for row in rows} == {"listener_bybit_listings"}
+    assert fetcher.get_json("/v1/thing") == {"ok": True}
+    assert slept.delays == [7.0]
 
 
-def test_bybit_listener_poll_raises_on_a_nonzero_retcode_but_poll_once_absorbs_it(
-    writer: SignalWriter, log: JsonlLog
-) -> None:
-    transport = RecordingTransport().add(
-        bybit_listings.ANNOUNCEMENTS_PATH, 200, {"retCode": 10001, "retMsg": "params error"}
+def test_fetcher_gives_up_after_max_retries() -> None:
+    transport = SequencedTransport((500, {"error": "boom"}))
+    fetcher = HttpFetcher(
+        base_url="https://source.example.invalid",
+        client=httpx.Client(transport=transport),
+        max_retries=2,
+        sleep=RecordingSleep(),
     )
-    listener = bybit_listings.BybitListingsListener(
-        writer, fetcher=make_fetcher(transport, base_url=bybit_listings.BASE_URL), log=log
-    )
-    with pytest.raises(RuntimeError):
-        listener.poll()
+    with pytest.raises(FetchError, match="HTTP 500"):
+        fetcher.get_json("/v1/thing")
+    assert len(transport.requests) == 2
 
-    assert listener.poll_once() == []
-    assert listener.stats.failures == 1
-    assert listener.stats.consecutive_failures == 1
-    assert signal_rows(writer.store) == []
-    assert log_events(log, "poll_failed")
+
+def test_fetcher_retries_a_transport_error_then_raises() -> None:
+    transport = SequencedTransport(httpx.ConnectError("no route to host"))
+    fetcher = HttpFetcher(
+        base_url="https://source.example.invalid",
+        client=httpx.Client(transport=transport),
+        max_retries=3,
+        sleep=RecordingSleep(),
+    )
+    with pytest.raises(FetchError, match="failed after 3 attempts"):
+        fetcher.get_text("/v1/thing")
+    assert len(transport.requests) == 3
+
+
+def test_fetcher_does_not_retry_a_permanent_4xx() -> None:
+    transport = SequencedTransport((404, {"error": "gone"}))
+    fetcher = HttpFetcher(
+        base_url="https://source.example.invalid",
+        client=httpx.Client(transport=transport),
+        max_retries=3,
+        sleep=RecordingSleep(),
+    )
+    with pytest.raises(FetchError, match="HTTP 404"):
+        fetcher.get_json("/v1/thing")
+    assert len(transport.requests) == 1
+
+
+def test_fetcher_raises_on_a_non_json_body() -> None:
+    fetcher = make_fetcher(
+        RecordingTransport().add("/v1/thing", 200, "<html>not json</html>"),
+        base_url="https://source.example.invalid",
+    )
+    with pytest.raises(FetchError, match="did not return JSON"):
+        fetcher.get_json("/v1/thing")
+
+
+def test_fetcher_uses_the_rate_limiter_on_every_attempt() -> None:
+    limiter = CountingLimiter()
+    transport = SequencedTransport((503, {}), (200, {"ok": True}))
+    fetcher = HttpFetcher(
+        base_url="https://source.example.invalid",
+        client=httpx.Client(transport=transport),
+        rate_limiter=limiter,
+        max_retries=3,
+        sleep=RecordingSleep(),
+    )
+    fetcher.get_json("/v1/thing")
+    assert limiter.acquires == 2
+
+
+def test_fetcher_backoff_is_exponential_jittered_and_capped() -> None:
+    fetcher = HttpFetcher(backoff_seconds=1.0, max_backoff_seconds=10.0)
+    assert 1.0 <= fetcher.backoff_delay(1) <= 1.1
+    assert 2.0 <= fetcher.backoff_delay(2) <= 2.2
+    assert 8.0 <= fetcher.backoff_delay(4) <= 8.8
+    assert 10.0 <= fetcher.backoff_delay(20) <= 11.0  # capped, then jittered
+    assert fetcher.backoff_delay(1, retry_after=100.0) == 10.0  # Retry-After is capped too
+
+
+def test_fetcher_joins_the_base_url_and_accepts_an_absolute_url() -> None:
+    transport = (
+        RecordingTransport()
+        .add("/api/v1/thing", 200, {"ok": True})
+        .add("/absolute", 200, {"ok": True})
+    )
+    fetcher = make_fetcher(transport, base_url="https://source.example.invalid")
+    fetcher.get_json("/api/v1/thing")
+    fetcher.get_json("https://other.example.invalid/absolute")
+    assert [str(request.url) for request in transport.requests] == [
+        "https://source.example.invalid/api/v1/thing",
+        "https://other.example.invalid/absolute",
+    ]
+
+
+def test_fetcher_with_zero_retries_fails_immediately() -> None:
+    transport = SequencedTransport((200, {"ok": True}))
+    fetcher = HttpFetcher(
+        base_url="https://source.example.invalid",
+        client=httpx.Client(transport=transport),
+        max_retries=0,
+    )
+    with pytest.raises(FetchError):
+        fetcher.get_json("/v1/thing")
+    assert transport.requests == []
+
+
+def test_fetcher_close_releases_the_client() -> None:
+    fetcher = make_fetcher(RecordingTransport())
+    assert fetcher.client is not None
+    fetcher.close()
+    assert fetcher.client is None
 
 
 # __SENTINEL__
