@@ -26,7 +26,12 @@ After=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=%h/work/AgentoQuant
-Environment=AGENTOQUANT_TELEGRAM=1
+# Notifications OFF for the soak. The placeholder decision source is scaffolding, so its Decision
+# Card says the same thing every hour ("placeholder source: the thesis is not a real forecast yet")
+# and a card per tick trains the reader to ignore the veto gate before it ever matters. The
+# notifier itself is exercised on demand - `AGENTOQUANT_TELEGRAM=1 agentoquant paper --placeholder`
+# - and the real veto window arrives with the agent cascade in Phase 2 (Task 21).
+Environment=AGENTOQUANT_TELEGRAM=0
 EnvironmentFile=-%h/.config/agentoquant/freqtrade.env
 ExecStart=%h/work/AgentoQuant/.venv/bin/agentoquant paper --placeholder --hours 1
 TimeoutStartSec=900
