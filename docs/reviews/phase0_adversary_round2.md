@@ -1239,7 +1239,9 @@ that quota spending is metered and reported.
 and add a refusal-throttle so a persistently exhausted source writes one refusal line per window rather
 than one per attempt.
 
----## Can Phase 0's checkpoint be signed off?
+---
+
+## Can Phase 0's checkpoint be signed off?
 
 **No. Not as stated.** The fix round did real work — 15 of the 18 round-1 findings are genuinely
 addressed, two more are addressed in their mechanism and honestly declared as gaps, and the evidence I
