@@ -31,7 +31,6 @@ from agentoquant.config_loader import (
 from agentoquant.enums import Sleeve
 from tests.conftest import write_secret_file
 
-
 # ----------------------------------------------------------------------------------------------
 # The committed config is valid
 # ----------------------------------------------------------------------------------------------

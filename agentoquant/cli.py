@@ -23,7 +23,7 @@ import importlib
 import json
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -373,7 +373,7 @@ def call_log_path() -> Path:
 def log_call(command: str, output: CommandOutput, *, client: str, source: str) -> None:
     """Append one JSON line to the shared call log. Never raises, never records a secret."""
     record = {
-        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "ts": datetime.now(UTC).isoformat(timespec="seconds"),
         "command": command,
         "status": output.status,
         "client": client,

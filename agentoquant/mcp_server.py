@@ -19,6 +19,7 @@ from mcp.server.fastmcp import FastMCP
 from agentoquant import cli
 from agentoquant.config_loader import ConfigError, validate_all
 
+
 #: The MCP tool listing, derived from the CLI's registry so the two cannot drift.
 def registered_tool_names() -> list[str]:
     """Tool names this server exposes, in the CLI's order."""

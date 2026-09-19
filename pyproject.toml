@@ -73,3 +73,8 @@ extend-exclude = [".venv"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+# Rules deliberately not enforced, because the spec mandates the exact form they would rewrite:
+#   UP042  the addendum writes `class Action(str, Enum)` and the other six enums verbatim (section 3)
+#   UP045  the addendum's ledger, brief and card shapes use `Optional[...]` literally (sections 4-6)
+#   B008   `typer.Option(...)` in a default argument is Typer's idiomatic CLI form
+ignore = ["UP042", "UP045", "B008"]
