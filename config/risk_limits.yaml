@@ -1,0 +1,64 @@
+# Hard risk limits. These are the Risk Gate's inputs. The gate is deterministic code and can only
+# shrink or reject a proposal, never enlarge it.
+#
+# Values marked "initial value, tunable" are the plan's judgment calls where it named a limit but no
+# number; they are config so they can be reviewed and changed, and Task 5 reads them rather than
+# hard-coding anything.
+version: 1
+
+positions:
+  min_concurrent: 3
+  max_concurrent: 5
+  # Per-position cap as a percent of book value (plan: 15 percent).
+  max_position_pct: 15
+  sleeve_caps_pct:
+    A: 100
+    B: 35
+    C: 20
+
+turnover:
+  # Buy notional plus sell notional per day, as a percent of book value. Initial value, tunable.
+  # This is the limit that stops the hourly cadence from becoming fee drag: the real-money LLM
+  # contest was decided by fees, and the most active model made 238 trades against 38.
+  daily_turnover_cap_pct: 25
+  note: "Reached the cap means the next entry waits, not that the cap moves."
+
+halts:
+  daily_loss_halt_pct: 3
+  weekly_drawdown_halt_pct: 8
+  weekly_halt_requires_human_restart: true
+  daily_halt_resets_at: "00:00"
+
+execution:
+  # Post-only is mandatory rather than preferred at Tier 1, where a taker round trip costs 1.6 percent.
+  post_only_default: true
+  mandatory_stop_on_exchange: true
+  max_reprices: 3
+  market_orders_allowed_for: [stop_loss, emergency_exit]
+
+liquidity:
+  # 24-hour quote volume below this and the coin is untradeable. Initial value, tunable.
+  min_24h_volume_usd: 1000000
+  max_spread_pct: 0.5
+
+cooldown:
+  consecutive_losses: 2
+  cooldown_hours: 6
+
+regulatory:
+  # Ontario CSA net-buy cap on assets other than BTC, ETH, LTC and BCH, enforced by the gate while
+  # Shahrad is a Canadian resident. The gate counts net buys over a rolling 12-month window.
+  ontario_net_buy_cap_cad: 30000
+  ontario_net_buy_window_months: 12
+
+funding:
+  # Free cash per sleeve, as a percent of that sleeve's target. Below the floor the gate raises a
+  # Funding Request card instead of silently shrinking positions.
+  free_cash_floor_pct:
+    A: 10
+    B: 10
+    C: 10
+  # Shahrad's standing monthly cap so the bot cannot ask repeatedly: at most this many Funding
+  # Request cards per calendar month.
+  monthly_request_cap: 4
+  note: "The agent never moves fiat and never holds withdrawal permission; Shahrad moves the money."

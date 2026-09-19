@@ -1,0 +1,51 @@
+# Sleeve definitions: caps, floors, entry-confidence thresholds and the universe per sleeve.
+#
+# Sleeve A and B open now. Sleeve C opens only after A and B prove positive, on a second exchange
+# (UAE residency), and it is disabled here until Task 27 turns it on.
+version: 1
+
+sleeves:
+  A:
+    name: "Blue chip and stable"
+    venue: kraken
+    floor_pct: 40
+    cap_pct: 100
+    position_cap_pct: 15
+    entry_confidence: 60
+    coins: [BTC, ETH, SOL]
+    cash: [USD, USDC, CAD]
+    enabled: true
+    usage_filter_required: false
+    note: >-
+      The reserve layer. Speculative profits rotate back here (standing prior 2), so it has a floor
+      rather than a cap. Stablecoins count as cash inside this sleeve.
+
+  B:
+    name: "AI-serving"
+    venue: kraken
+    floor_pct: 0
+    cap_pct: 35
+    position_cap_pct: 15
+    entry_confidence: 65
+    coins: [VVV, TAO, RENDER, AKT]
+    cash: []
+    enabled: true
+    usage_filter_required: false
+    note: >-
+      Kraken already lists VVV, TAO, RENDER and AKT. DGRID-type projects join this list when Kraken
+      lists them; the coin list is config, not code, so adding one is a reviewed config change.
+
+  C:
+    name: "New and breakout (second exchange)"
+    venue: "bybit or okx (UAE residency, deferred)"
+    floor_pct: 0
+    cap_pct: 20
+    position_cap_pct: 5
+    entry_confidence: 75
+    coins: []
+    cash: []
+    enabled: false
+    usage_filter_required: true
+    note: >-
+      Opens only after sleeves A and B prove positive (Task 27). Must pass the usage filter and the
+      liquidity floor, and fails closed when usage or unlock data is missing.

@@ -1,0 +1,79 @@
+# The Worldview document and Shahrad's five standing priors.
+#
+# These priors are his and are encoded into the system, not learned from data. Each one appears three
+# ways: as a numeric prior mean for the Bayesian model, as a deterministic regime rule the Risk Gate
+# and Judge respect, and as text every agent reads.
+#
+# The system may report when a prior hurts calibration. It never edits one, and no agent may argue a
+# prior out of existence: the Adversary is explicitly allowed to argue against a prior WITH DATA, but
+# cannot change it.
+version: 1
+doc_version: "1.0.0"
+effective_from: 2026-09-18
+
+priors:
+  - id: ai_compute_demand_compounds
+    text: >-
+      AI compute demand keeps compounding: AI-serving and inference infrastructure tokens have a
+      structural tailwind beyond short-term hype.
+    bayesian_prior_mean: 0.65
+    regime_rule: "Sleeve B keeps its floor of conviction; a drawdown in AI-serving names is not itself a sell signal."
+    applies_to: [VVV, TAO, RENDER, AKT]
+
+  - id: btc_eth_are_the_reserve_layer
+    text: >-
+      BTC and ETH are the reserve layer: keep a core allocation, and rotate speculative profits back
+      into it.
+    bayesian_prior_mean: 0.60
+    regime_rule: "Sleeve A keeps its 40 percent floor; speculative profits rotate back into it."
+    applies_to: [BTC, ETH]
+
+  - id: usage_beats_narrative
+    text: >-
+      Usage beats narrative: only trade hype that has real product usage, on-chain activity or
+      revenue behind it. Pure meme momentum is noise unless treated as a short-horizon trade.
+    bayesian_prior_mean: 0.70
+    regime_rule: "A social spike without volume or order book support is hype risk, not signal."
+    applies_to: [VVV, TAO, RENDER, AKT]
+
+  - id: policy_news_moves_everything
+    text: >-
+      Policy news moves everything: US and UAE regulatory and macro news dominate short-term
+      direction over technicals.
+    bayesian_prior_mean: 0.60
+    regime_rule: "A verified policy shock pauses new entries for 24 hours."
+    applies_to: [BTC, ETH, SOL, VVV, TAO, RENDER, AKT]
+
+  - id: wars_gold_dollar_set_the_regime
+    text: >-
+      Wars, gold and the dollar set the regime: Middle East and other conflicts, the gold price and
+      the value of the US dollar are standing regime signals. Escalation with gold and the dollar
+      rising together reads as risk-off for crypto beta.
+    bayesian_prior_mean: 0.60
+    regime_rule: >-
+      Conflict escalation with gold and the dollar rising together caps the speculative sleeve, blocks
+      new speculative entries and tightens stops.
+    applies_to: [BTC, ETH, SOL, VVV, TAO, RENDER, AKT]
+
+regime_rules:
+  - id: risk_off_conflict_gold_dollar
+    when: "Conflict escalation is detected AND gold is rising AND the dollar is rising."
+    then: >-
+      Cap the speculative sleeve at its current size, block new speculative entries, and tighten stops
+      on existing positions.
+  - id: policy_shock_pause
+    when: "A policy shock is verified (two independent sources, or a primary source plus a price and volume reaction)."
+    then: "Pause new entries for 24 hours. Existing positions keep their stops."
+  - id: stale_data_hold
+    when: "Critical data is stale or a required source is missing."
+    then: "Hold-only mode for the cycle: no new entries, no size increases."
+  - id: fee_drag_brake
+    when: "The daily turnover cap is reached."
+    then: "Defer new entries to the next cycle. The cap is never raised mid-day."
+
+prohibitions:
+  - "Never edit a prior. Report that it may be hurting calibration and leave it to Shahrad."
+  - "Never trade pure meme momentum as if it were usage-backed."
+  - "Never let a model enlarge a size: the Risk Gate can only shrink or reject."
+  - "Never treat a single viral post or single-source story as a trigger."
+  - "Never move fiat, never request a withdrawal, never handle a withdrawal address."

@@ -1,0 +1,45 @@
+# AgentoQuant runtime settings. Loaded and validated at every CLI/MCP startup (fails closed).
+version: 1
+
+# Hourly cadence, not high frequency. The scheduler fires one decision cycle per interval.
+cadence: hourly
+cadence_minutes: 60
+
+# The daily review is delivered at 10:00 America/Toronto and read by Shahrad himself.
+timezone: America/Toronto
+daily_report_time: "10:00"
+
+capital:
+  currency: CAD
+  # Verified account balance 2026-09-18: roughly $900 (~$572 USD, 0.004 BTC, small alts).
+  # The plan sized the project against "under $10k"; this is the real number until capital is added.
+  # Sizing itself always reads live balances from Kraken, never this figure.
+  starting_capital: 900.0
+  go_live_fraction: 0.25
+  note: "Live at 25 percent of capital first (Task 26). Raise this value only through a reviewed config change."
+
+venue:
+  exchange: kraken
+  # Paper until Task 26. Going live is a reviewed config change, never an agent decision.
+  mode: paper
+  quote_currency: USD
+  dry_run: true
+
+llm:
+  # 130 CAD/month covers the trading pipeline's model calls AND coding work.
+  monthly_cost_cap_cad: 130.0
+  cost_currency: CAD
+  meter: per_call
+  # OpenRouter responses carry an exact usage.cost: read it, never estimate from token counts.
+  read_exact_cost_from_response: true
+  note: "Sonnet-class roles run on OpenRouter anthropic/claude-sonnet-5 with the project's own key."
+
+human_in_the_loop:
+  telegram: true
+  # The Decision Card auto-executes after this window unless vetoed.
+  veto_window_minutes: 10
+  commands: ["veto", "pause", "resume", "status", "why", "flat", "fund"]
+
+ledger_path: data/ledger.duckdb
+log_dir: logs
+call_log_path: logs/mcp_calls.jsonl

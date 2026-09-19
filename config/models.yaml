@@ -1,0 +1,138 @@
+# Model routing per role. Validated against the ModelFamily enum at startup.
+#
+# A config naming an Opus-class model or a "big" profile fails validation and the process refuses to
+# start (see BANNED_FAMILIES / BANNED_PROFILES in agentoquant/config_loader.py). There is no big
+# profile anywhere in this project.
+#
+# Harness records the role's model TIER, not the transport: every model call in this pipeline goes
+# through OpenRouter with the project's own key, including the Sonnet-class roles. See docs/HANDOFF.md
+# decision 1.
+#
+# Model ids verified against the live OpenRouter catalogue 2026-09-18. Prices are per 1M tokens
+# (in/out): deepseek-v4.1-flash 0.15/0.60 · glm-5.3-flash 0.09/0.30 · kimi-k3 2.10/10.95 ·
+# claude-sonnet-5 2/10 · gemini-3.8-flash 0.75/3.75.
+version: 1
+
+banned:
+  families: [claude_opus, opus, claude-opus]
+  profiles: [big, large, xlarge, xxlarge]
+  model_substrings: [opus]
+
+roles:
+  # ----------------------------------------------------------------------------------------------
+  # Five independent analysts. Cheap models, structured output, no peer chatter, run in parallel.
+  # ----------------------------------------------------------------------------------------------
+  analyst_technical:
+    family: deepseek
+    model: deepseek/deepseek-v4.1-flash
+    harness: hermes_openrouter
+    profile: small
+    max_cost_usd_per_call: 0.05
+    notes: "Price and technical structure. The price/on-chain analyst was the alpha driver in the crypto multi-agent tests."
+
+  analyst_news_policy:
+    family: deepseek
+    model: deepseek/deepseek-v4.1-flash
+    harness: hermes_openrouter
+    profile: small
+    max_cost_usd_per_call: 0.05
+    notes: "News and policy. Policy news dominates short-term direction (standing prior 4)."
+
+  analyst_social_hype:
+    family: deepseek
+    model: deepseek/deepseek-v4.1-flash
+    harness: hermes_openrouter
+    profile: small
+    max_cost_usd_per_call: 0.05
+    notes: "Social and hype. Usage beats narrative (standing prior 3): hype without usage is noise."
+
+  analyst_macro_geopolitics:
+    family: deepseek
+    model: deepseek/deepseek-v4.1-flash
+    harness: hermes_openrouter
+    profile: small
+    max_cost_usd_per_call: 0.05
+    notes: "Macro and geopolitics. Conflict escalation with gold and the dollar rising reads risk-off."
+
+  analyst_onchain_usage:
+    family: deepseek
+    model: deepseek/deepseek-v4.1-flash
+    harness: hermes_openrouter
+    profile: small
+    max_cost_usd_per_call: 0.05
+    notes: "On-chain and usage: fees, revenue, TVL, unlocks."
+
+  # ----------------------------------------------------------------------------------------------
+  # Two proposal samples from two families. If both say HOLD the cycle ends and no further calls run.
+  # ----------------------------------------------------------------------------------------------
+  proposer_deepseek:
+    family: deepseek
+    model: deepseek/deepseek-v4.1-flash
+    harness: hermes_openrouter
+    profile: small
+    max_cost_usd_per_call: 0.10
+    notes: "Cheap proposal sample on the small profile (Shahrad's recorded pin)."
+
+  proposer_claude:
+    family: claude_sonnet
+    model: anthropic/claude-sonnet-5
+    harness: claude_native
+    profile: small
+    max_cost_usd_per_call: 0.50
+    notes: "Second proposal sample, Sonnet-class. Never Opus."
+
+  # ----------------------------------------------------------------------------------------------
+  # Adversary: always a different family than the leading proposal, one round only.
+  # ----------------------------------------------------------------------------------------------
+  adversary:
+    family: glm
+    model: z-ai/glm-5.3-flash
+    harness: hermes_openrouter
+    profile: small
+    max_cost_usd_per_call: 0.05
+    notes: >-
+      GLM is the Adversary rather than Kimi on cost: glm-5.3-flash is 0.09/0.30 per 1M tokens against
+      kimi-k3's 2.10/10.95, roughly 23x cheaper for a role that must attack every actionable cycle.
+      moonshotai/kimi-k3 is the documented alternative if GLM's objections prove weak.
+
+  # ----------------------------------------------------------------------------------------------
+  # Judge: selection, not blending. One compact call per actionable cycle, skipped on HOLD cycles.
+  # ----------------------------------------------------------------------------------------------
+  judge:
+    family: claude_sonnet
+    model: anthropic/claude-sonnet-5
+    harness: claude_native
+    profile: small
+    max_cost_usd_per_call: 0.60
+    notes: >-
+      The last role to be cut, and the only one whose confidence number is fused and re-fit against
+      realized outcomes. Roughly $0.04 per call at the planned brief size.
+
+  # ----------------------------------------------------------------------------------------------
+  # Reporting and reflection
+  # ----------------------------------------------------------------------------------------------
+  reviewer_draft:
+    family: deepseek
+    model: deepseek/deepseek-v4.1-flash
+    harness: hermes_openrouter
+    profile: small
+    max_cost_usd_per_call: 0.15
+    notes: "Drafts the daily metrics from the ledger; the numbers come from SQL, not from the model."
+
+  reviewer_signoff:
+    family: claude_sonnet
+    model: anthropic/claude-sonnet-5
+    harness: claude_native
+    profile: small
+    max_cost_usd_per_call: 0.60
+    notes: "Signs off the daily review Shahrad reads at 10:00 Toronto time."
+
+  reflector:
+    family: claude_sonnet
+    model: anthropic/claude-sonnet-5
+    harness: claude_native
+    profile: small
+    max_cost_usd_per_call: 1.00
+    notes: >-
+      Weekly, embargoed outcomes only. Proposes playbook updates with ledger evidence; nothing merges
+      without Shahrad's approval and priors are never edited.

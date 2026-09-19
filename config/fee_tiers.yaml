@@ -1,0 +1,62 @@
+# Kraken fee tiers. Loaded and validated at startup; the Risk Gate and the Judge price every trade
+# against a tier from this table.
+#
+# Kraken moved to cross-platform fee tiers on 2026-07-09. Tiers also count assets held on the
+# platform, so the tier can move on balance alone, not only on trading volume.
+#
+# current_tier is Tier 1: verified live 2026-09-18 from TradeVolume, where the account's 30-day
+# volume was ~$1,022 against a $2,500 threshold for Tier 2. Code prefers the live tier whenever
+# TradeVolume is reachable (prefer_live_tier below); this value is the offline fallback.
+#
+# backtest_default_tier is Tier 2 because that is Shahrad's recorded decision for the first month of
+# backtests. It is the OPTIMISTIC case while the account sits on Tier 1: a taker round trip at Tier 1
+# costs 1.6 percent, which is why post-only maker execution is mandatory rather than preferred.
+version: 1
+venue: kraken
+effective_from: 2026-07-09
+current_tier: tier_1
+prefer_live_tier: true
+backtest_default_tier: tier_2
+
+tiers:
+  - id: tier_1
+    name: "Spot Tier 1"
+    maker_pct: 0.40
+    taker_pct: 0.80
+    volume_30d_usd_min: 0
+    volume_30d_usd_max: 2500
+    note: "The tier the account is actually on. A taker round trip costs 1.6 percent here."
+  - id: tier_2
+    name: "Spot Tier 2"
+    maker_pct: 0.30
+    taker_pct: 0.60
+    volume_30d_usd_min: 2500
+    volume_30d_usd_max: 10000
+    note: "Above $2,500 of 30-day volume. The backtest default (Shahrad's recorded decision)."
+  - id: tier_3
+    name: "Spot Tier 3"
+    maker_pct: 0.22
+    taker_pct: 0.38
+    volume_30d_usd_min: 10000
+    volume_30d_usd_max: 25000
+  - id: tier_4
+    name: "Spot Tier 4"
+    maker_pct: 0.20
+    taker_pct: 0.35
+    volume_30d_usd_min: 25000
+    volume_30d_usd_max: null
+    note: "Highest published spot tier."
+
+stablecoin_and_fx:
+  maker_pct: 0.20
+  taker_pct: 0.20
+  applies_to:
+    - USDC/USD
+    - USDT/USD
+    - USDC/EUR
+    - USD/CAD
+  note: "Flat 0.20 percent. This is why rotating to stablecoins in risk-off is cheaper than exiting to fiat."
+
+notes: >-
+  Every trade must clear the maker round trip at the tier the book is actually on. Market orders are
+  reserved for stops and emergency exits, where the taker fee is the price of getting out.

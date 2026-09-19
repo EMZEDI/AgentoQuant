@@ -1,0 +1,259 @@
+# Per-source endpoints, quotas and credential key NAMES.
+#
+# SECRET HYGIENE: this file lists the NAMES of environment variables that live in
+# ~/.config/agentoquant/credentials.env (mode 600, outside the repo). A raw key value here fails
+# validation on purpose. Every source below is read-only; the agent places orders only through
+# freqtrade, in paper mode until Task 26.
+version: 1
+
+sources:
+  # ----------------------------------------------------------------------------------------------
+  # Exchange
+  # ----------------------------------------------------------------------------------------------
+  kraken_rest:
+    kind: exchange
+    base_url: https://api.kraken.com
+    endpoints:
+      - /0/public/Time
+      - /0/public/AssetPairs
+      - /0/public/Ticker
+      - /0/public/OHLC
+      - /0/private/Balance
+      - /0/private/TradeBalance
+      - /0/private/TradeVolume
+      - /0/private/OpenOrders
+      - /0/private/ClosedOrders
+      - /0/private/Ledgers
+    credentials: [KRAKEN_API_KEY, KRAKEN_API_SECRET]
+    quota:
+      calls_per_minute: 15
+    cache_ttl_seconds: 60
+    notes: >-
+      Read-only private endpoints only; the agent never calls AddOrder/CancelOrder/AmendOrder/Withdraw*.
+      Quirks: the ledger endpoint is /0/private/Ledgers (not /Ledger); TradeVolume returns fee data
+      under fees_maker; OpenOrders/ClosedOrders nest rows under an open/closed key. The live fee tier
+      comes from TradeVolume, not from config.
+
+  kraken_archives:
+    kind: market_data
+    base_url: https://assets.kraken.com
+    endpoints:
+      - /marketing/institutions/Kraken_OHLCVT_2026Q2.zip
+      - /marketing/institutions/OHLCVT_Full_PARTS_SHA256SUMS.txt
+    keyless: true
+    quota:
+      calls_per_day: 4
+    cache_ttl_seconds: 86400
+    notes: >-
+      Full 1h history for Task 7. The quarterly incremental is 538 MB; the full set is five ~2 GB
+      parts with checksums in OHLCVT_Full_PARTS_SHA256SUMS.txt. Rows are
+      timestamp,open,high,low,close,volume,trades with no header and gaps omitted, not zero-filled.
+
+  bybit_announcements:
+    kind: exchange
+    base_url: https://api.bybit.com
+    endpoints:
+      - /v5/announcements/index
+    keyless: true
+    quota:
+      calls_per_minute: 10
+    cache_ttl_seconds: 30
+    notes: "Early-signal layer: new listings, ahead of the first article."
+
+  okx_announcements:
+    kind: exchange
+    base_url: https://www.okx.com
+    endpoints:
+      - /api/v5/support/announcements
+    keyless: true
+    quota:
+      calls_per_minute: 10
+    cache_ttl_seconds: 30
+    notes: "Early-signal layer: new listings, ahead of the first article."
+
+  kraken_listings_rss:
+    kind: exchange
+    base_url: https://blog.kraken.com
+    endpoints:
+      - /feed/
+    keyless: true
+    quota:
+      calls_per_minute: 2
+    cache_ttl_seconds: 60
+    notes: "Kraken asset-listing announcements; paired with AssetPairs polling every 10-30s."
+
+  # ----------------------------------------------------------------------------------------------
+  # Market data and macro
+  # ----------------------------------------------------------------------------------------------
+  coingecko:
+    kind: market_data
+    base_url: https://api.coingecko.com/api/v3
+    endpoints:
+      - /ping
+      - /coins/markets
+      - /coins/{id}/market_chart
+    credentials: [COINGECKO_API_KEY]
+    quota:
+      calls_per_minute: 10
+    cache_ttl_seconds: 300
+    notes: "Demo key verified live. Gap filler for altcoin history; not the primary price source."
+
+  twelve_data:
+    kind: macro
+    base_url: https://api.twelvedata.com
+    endpoints:
+      - /price
+      - /quote
+      - /time_series
+    credentials: [TWELVE_DATA_API_KEY]
+    quota:
+      calls_per_day: 800
+    cache_ttl_seconds: 300
+    notes: "Gold (XAU/USD) and a dollar-index proxy. Free tier; 401 without the key."
+
+  alpha_vantage:
+    kind: news
+    base_url: https://www.alphavantage.co
+    endpoints:
+      - /query?function=NEWS_SENTIMENT
+      - /query?function=DIGITAL_CURRENCY_DAILY
+    credentials: [ALPHA_VANTAGE_API_KEY]
+    quota:
+      calls_per_day: 25
+    cache_ttl_seconds: 3600
+    notes: >-
+      Confirmation layer only. 25 calls/day is the whole free budget, so this source is never on the
+      critical path and a missing reading degrades the cycle rather than failing it.
+
+  gold_api:
+    kind: macro
+    base_url: https://api.gold-api.com
+    endpoints:
+      - /price/XAU
+    keyless: true
+    quota:
+      calls_per_hour: 60
+    cache_ttl_seconds: 300
+    notes: "Keyless gold price; a standing regime signal alongside the dollar."
+
+  # ----------------------------------------------------------------------------------------------
+  # Geopolitics, news, social
+  # ----------------------------------------------------------------------------------------------
+  gdelt:
+    kind: geopolitics
+    base_url: https://api.gdeltproject.org/api/v2/doc/doc
+    endpoints:
+      - /
+    keyless: true
+    quota:
+      calls_per_minute: 1
+    cache_ttl_seconds: 900
+    notes: >-
+      Confirmation layer only, never a trigger. Returns 429 from this host with "one request every
+      5 s" and 10-13 s latency, so it is polled every 15 minutes at most, with backoff and caching.
+
+  github_releases:
+    kind: news
+    base_url: https://api.github.com
+    endpoints:
+      - /repos/{owner}/{repo}/releases
+    keyless: true
+    quota:
+      calls_per_hour: 30
+    cache_ttl_seconds: 900
+    notes: "Unkeyed GitHub allows 60 requests/hour; stay under half of it."
+
+  google_news_rss:
+    kind: news
+    base_url: https://news.google.com/rss
+    endpoints:
+      - /search
+    keyless: true
+    quota:
+      calls_per_minute: 6
+    cache_ttl_seconds: 600
+    notes: "Per-ticker headline RSS for the early-signal layer. Headlines are a SourceClass, not evidence."
+
+  telegram_previews:
+    kind: news
+    base_url: https://t.me/s
+    endpoints:
+      - /{channel}
+    keyless: true
+    quota:
+      calls_per_minute: 6
+    cache_ttl_seconds: 120
+    notes: >-
+      Public web previews of announcement channels only. No MTProto: that needs a dedicated account
+      and carries a ban risk the plan declines.
+
+  grok_x_search:
+    kind: social
+    base_url: https://openrouter.ai/api/v1
+    endpoints:
+      - /chat/completions
+    credentials: [AGENTOQUANT_OPENROUTER_KEY]
+    quota:
+      calls_per_hour: 20
+    cache_ttl_seconds: 300
+    notes: >-
+      X Search through OpenRouter's native web plugin on x-ai/grok-4.3 with x_search_filter
+      (allowed/excluded handles, date range). No xAI key needed. Results are cited summaries, so the
+      citations are stored; roughly $0.0096 per call, plus the xAI tool cost passed through.
+
+  # ----------------------------------------------------------------------------------------------
+  # Usage, unlocks, on-chain
+  # ----------------------------------------------------------------------------------------------
+  defillama:
+    kind: usage
+    base_url: https://api.llama.fi
+    endpoints:
+      - /overview/fees
+      - /protocol/{slug}
+      - /tvl/{slug}
+    keyless: true
+    quota:
+      calls_per_minute: 30
+    cache_ttl_seconds: 3600
+    notes: >-
+      Fees, revenue, TVL and DEX volumes. Emissions/unlocks are paid (HTTP 402) and are not used;
+      unlock data is best-effort from cryptorank below and its absence fails closed for sleeve C.
+
+  cryptorank:
+    kind: unlocks
+    base_url: https://api.cryptorank.io/v2
+    endpoints:
+      - /global
+      - /currencies
+    credentials: [CRYPTORANK_API_KEY]
+    quota:
+      calls_per_minute: 10
+      monthly_credits: 10000
+    cache_ttl_seconds: 3600
+    notes: >-
+      v2 base with an X-Api-Key header; limit must be one of 100/500/1000. Vesting/unlock endpoints
+      are NOT in the free Sandbox plan (403 "not available in your tariff plan", Pro is $4,750/yr),
+      so unlocks are best-effort and a missing schedule fails closed for sleeve C rather than being
+      assumed absent.
+
+  alchemy:
+    kind: onchain
+    base_url: https://eth-mainnet.g.alchemy.com/v2
+    endpoints:
+      - /
+    credentials: [ALCHEMY_API_KEY]
+    quota:
+      calls_per_day: 100000
+    cache_ttl_seconds: 0
+    notes: "Webhooks for large transfers, unlock transactions and new pools. Free tier."
+
+  helius:
+    kind: onchain
+    base_url: https://mainnet.helius-rpc.com
+    endpoints:
+      - /
+    credentials: [HELIUS_API_KEY]
+    quota:
+      calls_per_day: 50000
+    cache_ttl_seconds: 0
+    notes: "Solana equivalent of the Alchemy webhooks. POST only: a bare GET returns 404."
