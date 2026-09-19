@@ -158,4 +158,121 @@ def log_events(log: JsonlLog, name: str | None = None) -> list[dict]:
     return [record for record in records if name is None or record.get("event") == name]
 
 
+# ----------------------------------------------------------------------------------------------
+# Exchange listing announcements: Bybit and OKX
+# ----------------------------------------------------------------------------------------------
+
+BYBIT_LISTING_MS = 1_789_000_000_000  # 2026-09-16T12:26:40Z
+BYBIT_PUBLISHED_AT = datetime.fromtimestamp(BYBIT_LISTING_MS / 1000, tz=UTC)
+BYBIT_OBSERVED_AT = BYBIT_PUBLISHED_AT + timedelta(seconds=25)
+
+BYBIT_BODY: dict[str, Any] = {
+    "retCode": 0,
+    "retMsg": "OK",
+    "result": {
+        "list": [
+            {
+                "type": {"key": "new_crypto", "title": "New Crypto"},
+                "title": "Bybit will list PENGU (PENGU) for spot trading",
+                "url": "https://announcements.bybit.com/en-US/article/listing-pengu",
+                "publishTime": BYBIT_LISTING_MS,
+            },
+            {
+                "type": {"key": "delistings", "title": "Delistings"},
+                "title": "Bybit will delist XYZUSDT perpetual",
+                "url": "https://announcements.bybit.com/en-US/article/delist-xyz",
+                "publishTime": BYBIT_LISTING_MS + 1000,
+            },
+            {
+                "type": {"key": "product_updates", "title": "Product updates"},
+                "title": "Bybit margin tier update",
+                "url": "https://announcements.bybit.com/en-US/article/margin",
+                "publishTime": BYBIT_LISTING_MS + 2000,
+            },
+        ]
+    },
+}
+
+
+def test_bybit_new_listing_is_an_exchange_announcement_with_a_ticker() -> None:
+    events = bybit_listings.parse_bybit_announcements(BYBIT_BODY, observed_at=BYBIT_OBSERVED_AT)
+    listings = [event for event in events if event.event_type == "listing"]
+    assert len(listings) == 1
+    event = listings[0]
+    assert event.source_class is SourceClass.EXCHANGE_ANNOUNCEMENT
+    assert event.ticker == "PENGU"
+    assert event.raw_text_or_ref.endswith("listing-pengu")
+    assert event.detected_at == BYBIT_PUBLISHED_AT
+    assert event.published_at == BYBIT_PUBLISHED_AT
+    assert event.source == "bybit_listings"
+    assert event.block_number is None
+
+
+def test_bybit_delisting_is_policy_and_other_types_are_ignored() -> None:
+    events = bybit_listings.parse_bybit_announcements(BYBIT_BODY, observed_at=BYBIT_OBSERVED_AT)
+    policies = [event for event in events if event.event_type == "policy"]
+    assert len(policies) == 1
+    assert policies[0].ticker == "XYZ"
+    assert all("margin" not in event.raw_text_or_ref for event in events)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        [],
+        "not-a-mapping",
+        {},
+        {"retCode": 10001, "retMsg": "params error", "result": {}},
+        {"retCode": 0, "result": {"list": []}},
+        {"retCode": 0, "result": {"list": ["not-a-dict", {"type": "not-a-dict"}]}},
+        {"retCode": 0, "result": {"list": [{"type": {"key": "new_crypto"}, "title": "", "url": ""}]}},
+    ],
+)
+def test_bybit_malformed_and_empty_bodies_yield_no_events(payload: Any) -> None:
+    assert bybit_listings.parse_bybit_announcements(payload, observed_at=BYBIT_OBSERVED_AT) == []
+
+
+def test_bybit_listener_poll_once_writes_both_events_to_the_ledger(
+    writer: SignalWriter, log: JsonlLog
+) -> None:
+    transport = RecordingTransport().add(
+        bybit_listings.ANNOUNCEMENTS_PATH, 200, BYBIT_BODY
+    )
+    listener = bybit_listings.BybitListingsListener(
+        writer,
+        fetcher=make_fetcher(transport, base_url=bybit_listings.BASE_URL),
+        log=log,
+        clock=lambda: BYBIT_OBSERVED_AT,
+    )
+    written = listener.poll_once()
+
+    assert len(written) == 2
+    assert transport.paths == [bybit_listings.ANNOUNCEMENTS_PATH]
+    assert transport.query_params[0]["locale"] == "en-US"
+    rows = signal_rows(writer.store)
+    assert {row["event_type"] for row in rows} == {"listing", "policy"}
+    assert {row["source_class"] for row in rows} == {SourceClass.EXCHANGE_ANNOUNCEMENT.value}
+    assert {row["producer_role"] for row in rows} == {"listener_bybit_listings"}
+
+
+def test_bybit_listener_poll_raises_on_a_nonzero_retcode_but_poll_once_absorbs_it(
+    writer: SignalWriter, log: JsonlLog
+) -> None:
+    transport = RecordingTransport().add(
+        bybit_listings.ANNOUNCEMENTS_PATH, 200, {"retCode": 10001, "retMsg": "params error"}
+    )
+    listener = bybit_listings.BybitListingsListener(
+        writer, fetcher=make_fetcher(transport, base_url=bybit_listings.BASE_URL), log=log
+    )
+    with pytest.raises(RuntimeError):
+        listener.poll()
+
+    assert listener.poll_once() == []
+    assert listener.stats.failures == 1
+    assert listener.stats.consecutive_failures == 1
+    assert signal_rows(writer.store) == []
+    assert log_events(log, "poll_failed")
+
+
 # __SENTINEL__
