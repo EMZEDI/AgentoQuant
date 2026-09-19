@@ -489,9 +489,11 @@ def objection_severity(card: DecisionCard) -> int:
 class RiskGate:
     """Deterministic limits. It can shrink or reject a proposal, never enlarge it.
 
-    ``limits`` comes from ``config_risk_limits.yaml`` via ``load_risk_limits()``; the sleeve caps and
-    entry-confidence thresholds come from ``config/sleeves.yaml`` via ``load_sleeves()``, loaded once
-    at construction. ``ledger`` is optional: with it, every verdict and every funding request is
+    ``limits`` comes from ``config/risk_limits.yaml`` via ``load_risk_limits()``; the entry-confidence
+    thresholds come from ``config/sleeves.yaml`` via ``load_sleeves()``, loaded once at construction.
+    A sleeve's cap is the **tighter** of ``sleeves.yaml``'s ``cap_pct`` and ``risk_limits.yaml``'s
+    ``positions.sleeve_caps_pct``: neither file can silently loosen the other, and no key in the
+    limits file is dead. ``ledger`` is optional: with it, every verdict and every funding request is
     written; without it the gate still returns the same verdict and writes nothing.
     """
 
@@ -813,14 +815,20 @@ class RiskGate:
 
         sleeve_spec = self.sleeves.get(sleeve) if sleeve is not None else None
         per_position_cap = self.limits.positions.max_position_pct
-        if sleeve_spec is not None:
-            per_position_cap = min(per_position_cap, sleeve_spec.position_cap_pct)
+        if sleeve is not None and sleeve_spec is not None:
+            per_position_cap = min(
+                per_position_cap,
+                sleeve_spec.position_cap_pct,
+                self._diversification_cap_pct(sleeve),
+            )
         existing = context.position_for(coin)
         held = existing.size_pct if existing is not None else 0.0
         caps.append((RULE_POSITION_CAP, per_position_cap - held))
 
         if sleeve is not None and sleeve_spec is not None:
-            caps.append((RULE_SLEEVE_CAP, sleeve_spec.cap_pct - context.sleeve_weight(sleeve)))
+            caps.append(
+                (RULE_SLEEVE_CAP, self._sleeve_cap_pct(sleeve) - context.sleeve_weight(sleeve))
+            )
 
         caps.append((RULE_ONTARIO_NET_BUY_CAP, self._ontario_headroom_pct(context, coin, original)))
         caps.append((RULE_FREE_CASH, self._free_cash_headroom(card, context)))
@@ -842,6 +850,32 @@ class RiskGate:
         if remaining_cad <= 0.0:
             return 0.0
         return remaining_cad / context.book_value_cad * 100.0
+
+    def _sleeve_cap_pct(self, sleeve: Sleeve) -> float:
+        """The sleeve's cap: the tighter of ``sleeves.yaml`` and ``risk_limits.yaml``.
+
+        Both files state a cap. ``config/sleeves.yaml``'s ``cap_pct`` is the sleeve's target
+        allocation; ``config/risk_limits.yaml``'s ``positions.sleeve_caps_pct`` is the same limit
+        stated in the file named for limits, and the gate used to ignore it entirely, so editing it
+        changed nothing. Taking the tighter of the two means a change to either file binds, and a
+        loosening in one can never enlarge what the other permits.
+        """
+        from_sleeves = float(self.sleeves.get(sleeve).cap_pct)
+        from_limits = self.limits.positions.sleeve_caps_pct.get(sleeve)
+        if from_limits is None:
+            return from_sleeves
+        return min(from_sleeves, float(from_limits))
+
+    def _diversification_cap_pct(self, sleeve: Sleeve) -> float:
+        """The equal share of its sleeve that a single position may take.
+
+        ``positions.min_concurrent`` ("3 to 5 concurrent positions") is the number of positions the
+        book is meant to spread across, so one position may take at most
+        ``sleeve_cap / min_concurrent``. This is the shrink-only reading of the key: raising
+        ``min_concurrent`` tightens the cap, and it can never loosen a position limit.
+        """
+        count = max(1, int(self.limits.positions.min_concurrent))
+        return self._sleeve_cap_pct(sleeve) / float(count)
 
     def _free_cash_headroom(self, card: DecisionCard, context: PortfolioContext) -> float:
         """Free cash above the sleeve's floor, in percent of book value."""

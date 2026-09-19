@@ -13,8 +13,12 @@ ordinary argument.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+import pytest
+import yaml
 
 from agentoquant.config_loader import load_risk_limits, load_settings, repo_root
 from agentoquant.enums import Action, ConfidenceBand, Sleeve
@@ -30,7 +34,9 @@ from agentoquant.risk.gate import (
     RULE_INCOMPLETE_CARD,
     RULE_MISSING_SIZE,
     RULE_MISSING_STOP,
+    RULE_POSITION_CAP,
     RULE_REDUCTION_CAP,
+    RULE_SLEEVE_CAP,
     RULE_STALE_MARKET_DATA,
     RULE_UNRESOLVED_SEVERITY5,
     RULE_VENUE_STATUS,
@@ -447,3 +453,90 @@ def test_stale_data_does_not_block_a_reduction_or_a_stop() -> None:
     for action in (Action.TRIM, Action.EXIT, Action.SET_STOP, Action.TRAIL_STOP):
         verdict = evaluate(make_card(action=action, size_pct=4.0), base_context(markets=stale))
         assert verdict.verdict == "approved", (action, verdict.rule_fired)
+
+
+# ----------------------------------------------------------------------------------------------
+# F12 - dead config keys in risk_limits.yaml and a rule count that drifted from the code
+# ----------------------------------------------------------------------------------------------
+
+
+def with_positions(**overrides):
+    """The committed limits with one ``positions`` key changed, the way a reviewer would."""
+    limits = load_risk_limits()
+    return limits.model_copy(update={"positions": limits.positions.model_copy(update=overrides)})
+
+
+def sleeve_b_entry(limits=None):
+    """A sleeve B entry the cap rules bound, with the free-cash rule out of the way."""
+    card = make_card(sleeve=Sleeve.B, coin="TAO", size_pct=15.0)
+    context = base_context(
+        sleeve_weights_pct={Sleeve.A: 40.0, Sleeve.B: 10.0, Sleeve.C: 0.0},
+        free_cash_pct_by_sleeve={Sleeve.A: 30.0, Sleeve.B: 50.0, Sleeve.C: 5.0},
+        markets={"TAO": deep_market("TAO")},
+    )
+    return evaluate(card, context, limits=limits)
+
+
+def test_positions_sleeve_caps_pct_binds() -> None:
+    """F12: changing ``sleeve_caps_pct`` in the file named for limits used to change nothing."""
+    shipped = sleeve_b_entry()
+    assert (shipped.verdict, shipped.rule_fired) == ("shrunk", RULE_POSITION_CAP)
+    assert shipped.final_size_pct == pytest.approx(35.0 / 3.0)
+    tightened = sleeve_b_entry(
+        with_positions(sleeve_caps_pct={Sleeve.A: 100.0, Sleeve.B: 10.0, Sleeve.C: 20.0})
+    )
+    assert (tightened.verdict, tightened.rule_fired, tightened.final_size_pct) == (
+        "rejected",
+        RULE_SLEEVE_CAP,
+        0.0,
+    )
+
+
+def test_positions_min_concurrent_binds() -> None:
+    """F12: ``min_concurrent`` is read; it sets the equal share of a sleeve one position may take."""
+    shipped = sleeve_b_entry()
+    assert shipped.final_size_pct == pytest.approx(35.0 / 3.0)
+    assert shipped.rule_fired == RULE_POSITION_CAP
+    wider = sleeve_b_entry(with_positions(min_concurrent=5))
+    assert wider.final_size_pct == pytest.approx(35.0 / 5.0)
+    assert wider.final_size_pct < shipped.final_size_pct
+
+
+def test_every_positions_key_in_the_limits_file_is_read() -> None:
+    """F12: two of the five keys were dead config. Each one now moves a verdict."""
+    raw = yaml.safe_load((repo_root() / "config" / "risk_limits.yaml").read_text(encoding="utf-8"))
+    assert set(raw["positions"]) == {
+        "min_concurrent",
+        "max_concurrent",
+        "max_position_pct",
+        "sleeve_caps_pct",
+    }, "a new positions key needs a reader in the gate and a case in this test"
+    # max_concurrent and max_position_pct are covered by the rule suite; these two were the dead ones.
+    assert (
+        sleeve_b_entry(with_positions(min_concurrent=5)).final_size_pct
+        < sleeve_b_entry().final_size_pct
+    )
+    assert (
+        sleeve_b_entry(
+            with_positions(sleeve_caps_pct={Sleeve.A: 100.0, Sleeve.B: 10.0, Sleeve.C: 20.0})
+        ).final_size_pct
+        < sleeve_b_entry().final_size_pct
+    )
+
+
+def test_the_limits_file_can_only_tighten_a_cap() -> None:
+    """A looser value in the limits file cannot enlarge a cap: the tighter of the two wins."""
+    loosened = sleeve_b_entry(
+        with_positions(sleeve_caps_pct={Sleeve.A: 100.0, Sleeve.B: 100.0, Sleeve.C: 100.0})
+    )
+    assert loosened.final_size_pct == pytest.approx(35.0 / 3.0)
+    assert loosened.final_size_pct <= sleeve_b_entry().final_size_pct
+
+
+def test_the_status_doc_rule_count_matches_the_code() -> None:
+    """F12: ``docs/phase0_status.md`` said 22 rules while the module exposed 23."""
+    status = (repo_root() / "docs" / "phase0_status.md").read_text(encoding="utf-8")
+    documented = re.search(r"Deterministic Risk Gate \((\d+) rules\)", status)
+    assert documented is not None, "the status doc no longer states the rule count"
+    # Update this number and the status doc together whenever a rule is added.
+    assert int(documented.group(1)) == len(ALL_RULES) == 27
