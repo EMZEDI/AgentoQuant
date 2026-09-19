@@ -1,0 +1,21 @@
+# Hourly tick for the AgentoQuant paper loop. One cycle on the hour, every hour, unattended.
+#
+# Persistent=true means a tick missed while the box was off runs once at the next start, so a soak
+# reports its gaps honestly instead of silently skipping hours.
+#
+# Install (user units, no sudo):
+#   cp deploy/agentoquant-hourly.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agentoquant-hourly.timer
+
+[Unit]
+Description=Hourly tick for the AgentoQuant paper loop (dry-run)
+
+[Timer]
+OnCalendar=hourly
+AccuracySec=30s
+Persistent=true
+Unit=agentoquant-hourly.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,33 @@
+# AgentoQuant hourly paper cycle. systemd USER unit: linger is already enabled on this box, and a
+# systemd timer was chosen over Hermes cron because the tick must not depend on an LLM being in the
+# path (docs/phase0_implementation_plan.md section 6, Task 6).
+#
+# Dry-run only. The command runs the paper loop, which evaluates the Risk Gate, publishes a signal for
+# a dry-run freqtrade instance and records the cycle. It never places a real order.
+#
+# No secret lives in this file. The freqtrade REST credentials, if the local dry-run API is enabled,
+# come from ~/.config/agentoquant/freqtrade.env (mode 600, outside the repo); the leading "-" makes
+# that file optional.
+#
+# Install (user units, no sudo):
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/agentoquant-hourly.service deploy/agentoquant-hourly.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agentoquant-hourly.timer
+# Check:
+#   systemctl --user list-timers agentoquant-hourly.timer
+#   systemctl --user status agentoquant-hourly.service
+#   journalctl --user -u agentoquant-hourly.service -n 50
+
+[Unit]
+Description=AgentoQuant hourly paper cycle (dry-run)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/work/AgentoQuant
+Environment=AGENTOQUANT_TELEGRAM=1
+EnvironmentFile=-%h/.config/agentoquant/freqtrade.env
+ExecStart=%h/work/AgentoQuant/.venv/bin/agentoquant paper --placeholder --hours 1
+TimeoutStartSec=900
+Nice=10

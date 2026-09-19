@@ -1,0 +1,42 @@
+# AgentoQuant dry-run venue: freqtrade on Kraken, paper only.
+#
+# The hourly paper loop needs a venue to hand decisions to. Without this unit the loop still runs
+# and records every cycle, but it reports the venue as unavailable and no order is ever submitted,
+# so a soak would prove nothing about execution.
+#
+# Dry-run only: `--dry-run` is not optional here, and the exchange keys in the repo config are empty
+# on purpose. Nothing in this unit can place a real order.
+#
+# No secret lives in this file. The local REST override that turns on the API server (and the
+# password the order manager authenticates with) comes from ~/.config/agentoquant/ (mode 600,
+# outside the repo); the leading "-" on both paths makes them optional.
+#
+# Install (user units, no sudo):
+#   cp deploy/agentoquant-freqtrade.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now agentoquant-freqtrade.service
+# Check:
+#   systemctl --user status agentoquant-freqtrade.service
+#   curl -u "$AGENTOQUANT_FREQTRADE_USER:$AGENTOQUANT_FREQTRADE_PASSWORD" localhost:8080/api/v1/ping
+
+[Unit]
+Description=AgentoQuant freqtrade dry-run venue (Kraken, paper only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/work/AgentoQuant
+EnvironmentFile=-%h/.config/agentoquant/freqtrade.env
+ExecStart=%h/work/AgentoQuant/.venv/bin/freqtrade trade \
+    --config freqtrade_user_data/config.json \
+    --config %h/.config/agentoquant/freqtrade_local.json \
+    --strategy AgentBridgeStrategy \
+    --strategy-path freqtrade_user_data/strategies \
+    --dry-run
+Restart=on-failure
+RestartSec=15
+Nice=10
+
+[Install]
+WantedBy=default.target
