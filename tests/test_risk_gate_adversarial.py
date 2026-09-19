@@ -26,6 +26,7 @@ from agentoquant.risk.funding_floor import (
 )
 from agentoquant.risk.gate import (
     ALL_RULES,
+    REJECT_RULES,
     RULE_CONFIDENCE_BAND_NO_TRADE,
     RULE_COOLDOWN,
     RULE_DAILY_LOSS_HALT,
@@ -33,6 +34,7 @@ from agentoquant.risk.gate import (
     RULE_ENTRY_CONFIDENCE,
     RULE_FREE_CASH,
     RULE_FREE_CASH_FLOOR,
+    RULE_HOLD_SIZE_ZERO,
     RULE_INCOMPLETE_CARD,
     RULE_KILL_SWITCH_FLAT,
     RULE_MAX_CONCURRENT_POSITIONS,
@@ -44,12 +46,15 @@ from agentoquant.risk.gate import (
     RULE_ONTARIO_NET_BUY_CAP,
     RULE_POSITION_CAP,
     RULE_POST_ONLY_REQUIRED,
+    RULE_REDUCTION_CAP,
     RULE_SLEEVE_CAP,
     RULE_SLEEVE_DISABLED,
+    RULE_STALE_MARKET_DATA,
     RULE_UNRESOLVED_SEVERITY5,
     RULE_UNSUPPORTED_ACTION,
     RULE_VENUE_STATUS,
     RULE_WEEKLY_DRAWDOWN_HALT,
+    SHRINK_RULES,
     MarketContext,
     PortfolioContext,
     PositionContext,
@@ -282,6 +287,10 @@ REJECT_CASES: dict[str, tuple[dict, dict]] = {
     RULE_ENTRY_CONFIDENCE: ({"confidence": 58, "confidence_band": ConfidenceBand.SMALL}, {}),
     RULE_MISSING_STOP: ({}, {"stop_on_exchange": False, "stop_price": None}),
     RULE_POST_ONLY_REQUIRED: ({}, {"order_type": "market", "order_purpose": "entry"}),
+    RULE_STALE_MARKET_DATA: (
+        {},
+        {"markets": {"SOL": deep_market("SOL", as_of=NOW - timedelta(hours=3))}},
+    ),
     RULE_NOT_TRADABLE: ({}, {"markets": {"SOL": deep_market("SOL", tradable=False)}}),
     RULE_MIN_LIQUIDITY: ({}, {"markets": {"SOL": deep_market("SOL", volume_24h_usd=500_000.0)}}),
     RULE_MAX_SPREAD: ({}, {"markets": {"SOL": deep_market("SOL", spread_pct=0.9)}}),
@@ -312,6 +321,14 @@ SHRINK_CASES: dict[str, tuple[dict, dict, float]] = {
         {"free_cash_pct_by_sleeve": {Sleeve.A: 12.0, Sleeve.B: 10.0, Sleeve.C: 5.0}},
         2.0,
     ),
+    # A reduction of 25% of the book against the 12% position it reduces.
+    RULE_REDUCTION_CAP: (
+        {"action": Action.TRIM, "size_pct": 25.0},
+        {"positions": (PositionContext("SOL", Sleeve.A, 12.0, stop_on_exchange=True),)},
+        12.0,
+    ),
+    # A hold carries no size: whatever it asks for is shrunk to zero.
+    RULE_HOLD_SIZE_ZERO: ({"action": Action.HOLD, "size_pct": 9.0}, {}, 0.0),
 }
 
 
@@ -384,3 +401,15 @@ def test_a_malformed_objection_fails_closed(gate, limits):
         assert_never_enlarges(verdict)
         assert verdict.verdict == "rejected", objection
         assert verdict.rule_fired == RULE_UNRESOLVED_SEVERITY5
+
+
+def test_the_case_tables_cover_every_rule_the_gate_can_fire():
+    """One case per rule, both ways: a new rule without a case fails here, and so does a stale case."""
+    cases = set(REJECT_CASES) | set(SHRINK_CASES)
+    missing = sorted(set(ALL_RULES) - cases)
+    extra = sorted(cases - set(ALL_RULES))
+    assert cases == set(ALL_RULES), f"missing: {missing}, extra: {extra}"
+    assert len(REJECT_CASES) == len(REJECT_RULES)
+    assert len(SHRINK_CASES) == len(SHRINK_RULES)
+    assert set(REJECT_CASES) == set(REJECT_RULES)
+    assert set(SHRINK_CASES) == set(SHRINK_RULES)

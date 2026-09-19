@@ -447,6 +447,20 @@ def test_a_stale_snapshot_is_the_first_market_rule() -> None:
     assert verdict.rule_fired == RULE_STALE_MARKET_DATA
 
 
+def test_a_declared_limit_fails_closed_on_an_unknown_age() -> None:
+    """Declaring a staleness limit says snapshots carry timestamps: a missing one is stale."""
+    verdict = evaluate(make_card(), base_context(market_data_max_age_s=STALENESS_LIMIT_S))
+    assert (verdict.verdict, verdict.rule_fired) == ("rejected", RULE_STALE_MARKET_DATA)
+    fresh = evaluate(
+        make_card(),
+        base_context(
+            market_data_max_age_s=STALENESS_LIMIT_S,
+            markets={"SOL": deep_market("SOL", as_of=NOW - timedelta(minutes=1))},
+        ),
+    )
+    assert fresh.verdict == "approved"
+
+
 def test_stale_data_does_not_block_a_reduction_or_a_stop() -> None:
     """Stale market data stops new exposure; it does not trap a position."""
     stale = {"SOL": deep_market("SOL", is_stale=True)}

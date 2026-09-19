@@ -375,18 +375,21 @@ def _as_utc(moment: datetime) -> datetime:
     return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
 
 
-def market_data_is_stale(market: MarketContext, *, now: datetime, max_age_s: float) -> bool:
+def market_data_is_stale(
+    market: MarketContext, *, now: datetime, max_age_s: float, strict: bool = False
+) -> bool:
     """Whether the market state is too old to act on.
 
     The raw snapshot's own ``is_stale`` flag wins outright. With no ``as_of`` the age is unknown,
-    and the gate reports what it cannot know rather than inventing a timestamp: an entry is refused
-    on staleness the caller actually declared. Phase 0's placeholder loop does not populate it yet;
-    the ingest snapshot carries it, and Phase 2's brief is the caller that passes it in.
+    and the gate will not invent a timestamp, so an unknown age is stale only under ``strict`` -
+    which the caller turns on by declaring a ``market_data_max_age_s`` of its own, i.e. by saying
+    that its snapshots do carry timestamps. Phase 0's placeholder loop populates neither yet; the
+    ingest snapshot carries ``is_stale``, and Phase 2's brief is the caller that passes both in.
     """
     if market.is_stale:
         return True
     if market.as_of is None:
-        return False
+        return bool(strict)
     age_s = (_as_utc(now) - _as_utc(market.as_of)).total_seconds()
     return age_s > float(max_age_s)
 
@@ -728,7 +731,10 @@ class RiskGate:
             # No market state means no way to check liquidity or spread: fail closed.
             return RULE_MIN_LIQUIDITY, False, 0.0
         if market_data_is_stale(
-            market, now=now, max_age_s=self._market_data_max_age_s(context)
+            market,
+            now=now,
+            max_age_s=self._market_data_max_age_s(context),
+            strict=context.market_data_max_age_s is not None,
         ):
             # A snapshot that missed a whole cadence is history, not a market, and good numbers from
             # an old snapshot are exactly the stale-data attack this rule exists to stop.
