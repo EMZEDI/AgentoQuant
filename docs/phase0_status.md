@@ -15,7 +15,7 @@ where something could not be verified it says so instead of guessing.
 | 5 | Deterministic Risk Gate (22 rules), kill switch, funding floor | 18/18 acceptance checks against a real ledger; 133 adversarial tests, one case per rule |
 | 6 | Paper harness, freqtrade dry-run bridge, order manager for the twelve-action vocabulary, signal store, Telegram notifier, scheduler, systemd units | 24 consecutive cycles, 0 failures, three real dry-run trades each tagged with its cycle id |
 
-Gate on `main`: **197 tests pass, 1 skipped (opt-in live cost check), ruff clean.**
+Gate on `main`: **227 tests pass, 1 skipped (opt-in live cost check), ruff clean.**
 
 ## The loop is running unattended
 
@@ -23,6 +23,17 @@ Gate on `main`: **197 tests pass, 1 skipped (opt-in live cost check), ruff clean
 - `agentoquant-freqtrade.service` runs the dry-run venue the loop hands decisions to. Without it the
   loop still records cycles but submits nothing, so a soak would prove nothing about execution.
 - Both installed and enabled; first timer tick 06:00 UTC.
+- **The soak was silently meaningless for its first nine cycles, and that is now fixed.** The timer
+  runs a fresh process every hour (`paper --hours 1`), and the placeholder's pattern step was a
+  per-invocation counter starting at zero, so every tick picked the first pattern entry: all nine
+  recorded cycles were `enter_laddered`, and a three-day run would have exercised one of twelve
+  vocabulary actions while looking perfectly healthy. The step is now anchored to the hour it
+  belongs to, so consecutive ticks advance. `tests/test_paper_sequence.py` covers it, including a
+  test that drives the real loop twice an hour apart. The soak re-accumulates from 2026-09-19 ~13:30.
+- **Notifications are off for the soak** (`AGENTOQUANT_TELEGRAM=0` in the unit). The placeholder card
+  says the same thing every hour, and a card per tick trains the reader to ignore the veto gate
+  before it matters. The notifier is exercised on demand, and the real veto window arrives with the
+  cascade in Phase 2 (Task 21).
 
 Firing the timer's own unit (`systemctl --user start agentoquant-hourly.service`) proved the
 unattended path end to end: exit 0, cycle `2026-09-19T05Z-0001`, action `enter_laddered`, verdict
@@ -51,7 +62,7 @@ a real artifact, and the stop ratchets as the position grows.
    three ladder slices and opened a position. An unfilled status on a filled order corrupts any cost
    or hit-rate accounting built on it, so this is a correctness bug, not a completeness gap.
 
-## Two real bugs, found only by running it against a live venue
+## Three real bugs, found only by running it against a live venue
 
 1. **Position adjustment was off.** The config never set `position_adjustment_enable`, so freqtrade
    reported `Position adjustment: Off` and never called `adjust_trade_position`. Laddered entries,
