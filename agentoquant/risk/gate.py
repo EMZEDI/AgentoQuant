@@ -73,9 +73,25 @@ Halts and clock
 Only shrink or reject
 ---------------------
 :meth:`RiskGate.evaluate` clamps the final size into ``[0, original_size_pct]`` before returning, so
-no combination of inputs can enlarge a proposal. ``INCREASING_ACTIONS`` are the only actions that
-can be shrunk or rejected; ``trim``/``exit``/``hold`` and the stop-management actions pass through
-unchanged (still clamped).
+no combination of inputs can enlarge a proposal.
+
+All twelve vocabulary actions are evaluated by at least one rule that can shrink or reject them;
+none of them is a pass-through. Which rules apply to which action:
+
+``INCREASING_ACTIONS`` (``enter_laddered``, ``add``, ``event_trade``, ``rotate``, ``rebalance``)
+    every reject rule in ``REJECT_RULES``, then every shrink cap in ``SHRINK_RULES``.
+``REDUCING_ACTIONS`` (``trim``, ``exit``)
+    never blocked by a halt or by stale market data - a halt closes positions and freezing one is
+    the opposite of what it is for - but they must name a coin (``incomplete_card``), must ask for
+    a positive size (``missing_size``), and can never reduce more than the position the context
+    reports (``reduction_cap``).
+``Action.HOLD``
+    a no-op, approved at size 0.0 whatever size the card carries (``hold_size_zero``), so a
+    nonsensical size on a hold is never published as an approved size.
+stop and order management (``set_stop``, ``trail_stop``, ``take_profit_ladder``, ``cancel_order``)
+    also never blocked by a halt, but they must name a coin (``incomplete_card``), need a venue that
+    is ``online`` (``venue_status``), and a stop-management card must carry the stop it manages
+    (``missing_stop``).
 """
 
 from __future__ import annotations
@@ -127,6 +143,8 @@ RULE_FREE_CASH_FLOOR = "free_cash_floor"
 RULE_POSITION_CAP = "position_cap"
 RULE_SLEEVE_CAP = "sleeve_cap"
 RULE_FREE_CASH = "free_cash"
+RULE_REDUCTION_CAP = "reduction_cap"
+RULE_HOLD_SIZE_ZERO = "hold_size_zero"
 
 #: Every rule name this module can fire, in evaluation priority order.
 REJECT_RULES: tuple[str, ...] = (
@@ -153,7 +171,13 @@ REJECT_RULES: tuple[str, ...] = (
     RULE_FREE_CASH_FLOOR,
 )
 
-SHRINK_RULES: tuple[str, ...] = (RULE_POSITION_CAP, RULE_SLEEVE_CAP, RULE_FREE_CASH)
+SHRINK_RULES: tuple[str, ...] = (
+    RULE_POSITION_CAP,
+    RULE_SLEEVE_CAP,
+    RULE_FREE_CASH,
+    RULE_REDUCTION_CAP,
+    RULE_HOLD_SIZE_ZERO,
+)
 
 ALL_RULES: tuple[str, ...] = REJECT_RULES + SHRINK_RULES
 
@@ -163,12 +187,17 @@ VERDICT_SHRUNK = "shrunk"
 VERDICT_REJECTED = "rejected"
 
 #: Actions that increase risk and therefore face every entry rule. ``rotate`` and ``rebalance`` move
-#: value into a sleeve, so they are checked like an entry; ``trim`` and ``exit`` only reduce exposure
-#: and are never blocked by a halt (a halt closes positions, it does not freeze them).
+#: value into a sleeve, so they are checked like an entry.
 INCREASING_ACTIONS: frozenset[Action] = frozenset(
     {Action.ENTER_LADDERED, Action.ADD, Action.EVENT_TRADE, Action.ROTATE, Action.REBALANCE}
 )
+#: ``trim`` and ``exit`` only reduce exposure. They are never blocked by a halt (a halt closes
+#: positions, it does not freeze them) and never blocked by stale data, but they are bounded by the
+#: position they reduce and must name a coin and a size. See :meth:`RiskGate._evaluate_reducing`.
 REDUCING_ACTIONS: frozenset[Action] = frozenset({Action.TRIM, Action.EXIT})
+#: A no-op and the size-free order management. Neither is a pass-through: ``hold`` is approved at
+#: size 0.0, and the management actions must name a coin, need an online venue and (for the stop
+#: actions) carry the stop they manage. See :meth:`RiskGate._evaluate_management`.
 NEUTRAL_ACTIONS: frozenset[Action] = frozenset(
     {
         Action.HOLD,
@@ -177,6 +206,10 @@ NEUTRAL_ACTIONS: frozenset[Action] = frozenset(
         Action.TRAIL_STOP,
         Action.TAKE_PROFIT_LADDER,
     }
+)
+#: The management actions that manage a stop, and therefore must carry one.
+STOP_MANAGEMENT_ACTIONS: frozenset[Action] = frozenset(
+    {Action.SET_STOP, Action.TRAIL_STOP, Action.TAKE_PROFIT_LADDER}
 )
 
 #: Assets exempt from Ontario's net-buy cap (CSA rules exclude BTC, ETH, LTC and BCH).
@@ -428,11 +461,27 @@ class RiskGate:
                 card, context, VERDICT_REJECTED, RULE_UNSUPPORTED_ACTION, original, 0.0, False
             )
 
-        if action not in INCREASING_ACTIONS:
-            # Reductions and stop management: never enlarged, never blocked by a halt (a halt closes
-            # positions; freezing them would be the opposite of what it is for).
-            return self._verdict(card, context, VERDICT_APPROVED, None, original, original, False)
+        if action in INCREASING_ACTIONS:
+            return self._evaluate_increasing(card, context, action, original, now)
+        if action in REDUCING_ACTIONS:
+            return self._evaluate_reducing(card, context, action, original)
+        if action is Action.HOLD:
+            return self._evaluate_hold(card, context, original)
+        # Everything left is stop or order management. It carries no size the executor uses, so it
+        # is never shrunk for size; it is checked against the card, the venue and its own stop.
+        return self._evaluate_management(card, context, action, original)
 
+    # -- one path per action class -------------------------------------------------------------
+
+    def _evaluate_increasing(
+        self,
+        card: DecisionCard,
+        context: PortfolioContext,
+        action: Action,
+        original: float,
+        now: datetime,
+    ) -> RiskGateVerdict:
+        """An entry, add, event trade, rotate or rebalance: every entry rule applies."""
         rejection = self._first_rejection(card, context, action, original, now)
         if rejection is not None:
             rule, breach, shortfall_pct = rejection
@@ -464,6 +513,91 @@ class RiskGate:
             )
         verdict = VERDICT_SHRUNK if size < original else VERDICT_APPROVED
         return self._verdict(card, context, verdict, rule_fired, original, size, breach)
+
+    def _evaluate_reducing(
+        self,
+        card: DecisionCard,
+        context: PortfolioContext,
+        action: Action,
+        original: float,
+    ) -> RiskGateVerdict:
+        """``trim``/``exit``: a reduction is never blocked, but it is still bounded.
+
+        A halt closes positions and a stale snapshot does not make a position safer to hold, so
+        neither one blocks a reduction. What a reduction may not do is name no coin, ask for no
+        size, or ask to reduce more than the position the context reports. That position is the only
+        bound the gate can verify: when the context does not name the coin at all the size is left
+        alone, because the gate will not guess at a position it cannot see, and refusing to reduce
+        is the one failure mode worth avoiding.
+        """
+        del action
+        if card.coin is None:
+            return self._verdict(
+                card, context, VERDICT_REJECTED, RULE_INCOMPLETE_CARD, original, 0.0, False
+            )
+        if original <= 0.0:
+            return self._verdict(
+                card, context, VERDICT_REJECTED, RULE_MISSING_SIZE, original, 0.0, False
+            )
+        held = context.position_for(card.coin)
+        if held is None:
+            return self._verdict(card, context, VERDICT_APPROVED, None, original, original, False)
+        cap = max(0.0, float(held.size_pct))
+        if cap <= 0.0:
+            return self._verdict(
+                card, context, VERDICT_REJECTED, RULE_REDUCTION_CAP, original, 0.0, False
+            )
+        if cap < original:
+            return self._verdict(
+                card, context, VERDICT_SHRUNK, RULE_REDUCTION_CAP, original, cap, False
+            )
+        return self._verdict(card, context, VERDICT_APPROVED, None, original, original, False)
+
+    def _evaluate_hold(
+        self, card: DecisionCard, context: PortfolioContext, original: float
+    ) -> RiskGateVerdict:
+        """``hold``: a no-op, approved at size 0.0 whatever size the card carries.
+
+        A hold places nothing, so echoing the card's size back as an approved ``final_size_pct``
+        publishes a size for an action that has none - and the executor takes its size from the
+        verdict. A hold that carries a size is therefore shrunk to zero.
+        """
+        if original <= 0.0:
+            return self._verdict(card, context, VERDICT_APPROVED, None, original, 0.0, False)
+        return self._verdict(
+            card, context, VERDICT_SHRUNK, RULE_HOLD_SIZE_ZERO, original, 0.0, False
+        )
+
+    def _evaluate_management(
+        self,
+        card: DecisionCard,
+        context: PortfolioContext,
+        action: Action,
+        original: float,
+    ) -> RiskGateVerdict:
+        """``set_stop``, ``trail_stop``, ``take_profit_ladder``, ``cancel_order``.
+
+        Stop and order management is part of closing a position, so a halt does not block it. It
+        must still name the coin it manages, and it needs a venue that is ``online``: an order
+        handed to a venue in maintenance is an order that silently does nothing.
+        """
+        if card.coin is None:
+            return self._verdict(
+                card, context, VERDICT_REJECTED, RULE_INCOMPLETE_CARD, original, 0.0, False
+            )
+        if context.venue_status != VENUE_STATUS_OK:
+            return self._verdict(
+                card, context, VERDICT_REJECTED, RULE_VENUE_STATUS, original, 0.0, False
+            )
+        if (
+            action in STOP_MANAGEMENT_ACTIONS
+            and not context.stop_on_exchange
+            and context.stop_price is None
+        ):
+            return self._verdict(
+                card, context, VERDICT_REJECTED, RULE_MISSING_STOP, original, 0.0, False
+            )
+        return self._verdict(card, context, VERDICT_APPROVED, None, original, original, False)
 
     # -- rejections ----------------------------------------------------------------------------
 
@@ -729,6 +863,7 @@ __all__ = [
     "RULE_DAILY_TURNOVER_CAP",
     "RULE_ENTRY_CONFIDENCE",
     "RULE_FREE_CASH",
+    "RULE_HOLD_SIZE_ZERO",
     "RULE_FREE_CASH_FLOOR",
     "RULE_INCOMPLETE_CARD",
     "RULE_KILL_SWITCH_FLAT",
@@ -740,6 +875,7 @@ __all__ = [
     "RULE_NOT_TRADABLE",
     "RULE_ONTARIO_NET_BUY_CAP",
     "RULE_POSITION_CAP",
+    "RULE_REDUCTION_CAP",
     "RULE_POST_ONLY_REQUIRED",
     "RULE_SLEEVE_CAP",
     "RULE_SLEEVE_DISABLED",
@@ -749,6 +885,7 @@ __all__ = [
     "RiskGate",
     "SELL_ACTIONS",
     "SHRINK_RULES",
+    "STOP_MANAGEMENT_ACTIONS",
     "UNRESOLVED_OBJECTION_SEVERITY",
     "VENUE_STATUSES",
     "VENUE_STATUS_OK",
