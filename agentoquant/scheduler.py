@@ -105,13 +105,38 @@ def run_tick(*, placeholder: bool = True, cycle_id: str | None = None) -> dict:
     return paper.run_loop(hours=1, placeholder=placeholder, cycle_id=cycle_id, sleep=False)
 
 
+def run_outcome_pass(
+    *, as_of: datetime | None = None, prices: dict[str, float] | None = None
+) -> dict:
+    """Write the outcome rows whose horizon (+1h / +4h / +24h) has elapsed.
+
+    The outcome stage's writer is :mod:`agentoquant.ledger.outcomes`; this is the timer's hook for it,
+    so a box that never edits ``execution/paper.py`` still records horizons. Idempotent: running it on
+    every tick writes each ``(card, horizon)`` once, and a tick after downtime backfills whatever
+    elapsed. Imported lazily so a plain tick does not pay for the ledger's imports.
+    """
+    from agentoquant.ledger.outcomes import price_lookup_from, record_due_outcomes
+    from agentoquant.ledger.store import LedgerStore
+
+    return record_due_outcomes(LedgerStore(), as_of=as_of, price_lookup=price_lookup_from(prices))
+
+
 def main(argv: list[str] | None = None) -> int:
-    """``python -m agentoquant.scheduler``: one tick, or a printed view of the schedule."""
+    """``python -m agentoquant.scheduler``: one tick, one outcome pass, or a printed schedule."""
     parser = argparse.ArgumentParser(prog="agentoquant.scheduler", description=__doc__)
     parser.add_argument("--once", action="store_true", help="run exactly one paper cycle now")
     parser.add_argument("--placeholder", action="store_true", help="use the Phase 0 decision source")
     parser.add_argument("--cycle-id", default=None, help="override the cycle id")
     parser.add_argument("--show", action="store_true", help="print the next tick and exit")
+    parser.add_argument(
+        "--outcomes",
+        action="store_true",
+        help="write the outcome rows whose horizon has elapsed, then exit",
+    )
+    parser.add_argument("--as-of", default=None, help="ISO instant for --outcomes (UTC)")
+    parser.add_argument(
+        "--price", action="append", default=[], help="--outcomes price as COIN=VALUE (repeatable)"
+    )
     args = parser.parse_args(argv)
 
     if args.show:
@@ -121,6 +146,16 @@ def main(argv: list[str] | None = None) -> int:
         print(f"cycle id:   {cycle_id_for(now)}")
         print(f"units:      {deploy_dir()}")
         return 0
+
+    if args.outcomes:
+        from agentoquant.ledger.outcomes import main as outcomes_main
+
+        forwarded: list[str] = []
+        if args.as_of:
+            forwarded += ["--as-of", args.as_of]
+        for item in args.price:
+            forwarded += ["--price", item]
+        return outcomes_main(forwarded)
 
     result = run_tick(placeholder=args.placeholder or True, cycle_id=args.cycle_id)
     status = str(result.get("status", "ok"))
@@ -148,6 +183,7 @@ __all__ = [
     "hour_start",
     "main",
     "next_tick",
+    "run_outcome_pass",
     "run_tick",
     "seconds_until",
     "unit_path",
