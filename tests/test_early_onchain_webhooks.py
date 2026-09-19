@@ -123,7 +123,9 @@ def alchemy_payload(
     }
 
 
-def helius_payload(*, mint: str = SOL_MINT, tx_type: str = "TRANSFER", slot: Any = SLOT) -> list[dict[str, Any]]:
+def helius_payload(
+    *, mint: str = SOL_MINT, tx_type: str = "TRANSFER", slot: Any = SLOT
+) -> list[dict[str, Any]]:
     """A Helius enhanced-transaction body in the documented shape."""
     return [
         {
@@ -316,7 +318,7 @@ def test_an_unlock_registry_entry_becomes_an_unlock_event() -> None:
 def test_an_unattributed_transfer_is_recorded_not_dropped() -> None:
     """An address that is not in the registry is still evidence; it is written with no ticker."""
     events = parse_alchemy_webhook(
-        alchemy_payload(to_address=UNKNOWN_ADDRESS), observed_at=OBSERVED_AT, registry=registry_with()
+        alchemy_payload(to_address=UNKNOWN_ADDRESS), observed_at=OBSERVED_AT, registry=registry_with({})
     )
     assert len(events) == 1
     assert events[0].ticker is None
@@ -344,8 +346,11 @@ def test_parse_alchemy_webhook_handles_malformed_empty_and_wrong_type_bodies() -
 
 def test_an_unknown_alchemy_shape_is_recorded_rather_than_lost() -> None:
     """A provider schema change must show up in the ledger, not vanish."""
-    payload = {"type": "GRAPHQL", "event": {"network": "ETH_MAINNET", "data": {"block": {"number": BLOCK_HEX}}}}
-    events = parse_alchemy_webhook(payload, observed_at=OBSERVED_AT, registry=registry_with())
+    payload = {
+        "type": "GRAPHQL",
+        "event": {"network": "ETH_MAINNET", "data": {"block": {"number": BLOCK_HEX}}},
+    }
+    events = parse_alchemy_webhook(payload, observed_at=OBSERVED_AT, registry=registry_with({}))
     assert len(events) == 1
     assert events[0].ticker is None
     assert events[0].event_type == "large_transfer"
@@ -542,8 +547,8 @@ def test_a_bad_signature_fails_closed_and_writes_nothing(tmp_path: Any, monkeypa
 
     assert signal_rows(store) == []
     assert receiver.stats.written == 0
-    assert receiver.stats.failures == 4
-    assert receiver.stats.consecutive_failures == 4
+    assert receiver.stats.failures == 5
+    assert receiver.stats.consecutive_failures == 5
     assert receiver.stats.last_error == "signature_missing_or_invalid"
     rejected = log_events(writer.log, "webhook_rejected")
     assert [record["reason"] for record in rejected] == [
