@@ -1,0 +1,426 @@
+"""The kill switch: ``/flat``, the daily loss halt and the weekly drawdown halt.
+
+Owned by Task 5. Deterministic state transitions with an **injectable clock**; no LLM, no network,
+no exchange call of any kind. This module imports no exchange client and places no order: when a halt
+fires it returns the *plans* the executor must carry out (:class:`CloseOrderPlan`, always
+``dry_run=True``), and writes the human action to the ledger. Paper mode only.
+
+Three states, and what each does
+--------------------------------
+``flat``           ``/flat``. Every open position is closed and new entries are blocked until a
+                   ``resume``. Shahrad's panic button.
+``daily_halt``     The daily loss halt (``halts.daily_loss_halt_pct``, 3 percent). Same effect as
+                   ``/flat`` for the rest of the day: positions closed, entries blocked. It clears
+                   itself at ``halts.daily_halt_resets_at`` (``00:00`` in ``settings.timezone``,
+                   ``America/Toronto``), so the next trading day starts clean.
+``weekly_halt``    The weekly drawdown halt (``halts.weekly_drawdown_halt_pct``, 8 percent).
+                   ``halts.weekly_halt_requires_human_restart`` is true, so the gate must not clear
+                   it: only :meth:`KillSwitch.resume` with ``human=True`` does.
+
+:class:`HaltState` is the value the Risk Gate consumes through ``PortfolioContext.halts``; it blocks
+new entries and never blocks a ``trim`` or an ``exit``, because a halt exists to close positions, not
+to freeze them.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from agentoquant.config_loader import RiskLimits, load_settings
+from agentoquant.enums import Sleeve, Stage
+from agentoquant.ledger.schema import HumanActionPayload
+from agentoquant.ledger.store import LedgerStore
+
+#: Halt reasons.
+HALT_FLAT = "flat"
+HALT_DAILY = "daily_halt"
+HALT_WEEKLY = "weekly_halt"
+
+#: Human-action commands this module writes (the addendum's vocabulary).
+COMMAND_FLAT = "flat"
+COMMAND_PAUSE = "pause"
+COMMAND_RESUME = "resume"
+
+#: The Risk Gate's producer role for the automatic halts.
+RISK_GATE_ROLE = "risk_gate"
+
+#: Paper mode. No exchange write endpoint is reachable from this module by construction.
+VENUE_WRITES_ENABLED = False
+
+#: The order type a halt uses to close a position: a stop-out must not wait for a maker fill.
+CLOSE_ORDER_TYPE = "market"
+
+
+@dataclass(frozen=True)
+class HaltState:
+    """The halt flags the Risk Gate reads. ``entries_blocked`` is what stops a new position."""
+
+    flat: bool = False
+    daily_halted: bool = False
+    weekly_halted: bool = False
+
+    @property
+    def entries_blocked(self) -> bool:
+        return self.flat or self.daily_halted or self.weekly_halted
+
+    @property
+    def reasons(self) -> tuple[str, ...]:
+        """Which halts are active, in priority order."""
+        active: list[str] = []
+        if self.flat:
+            active.append(HALT_FLAT)
+        if self.daily_halted:
+            active.append(HALT_DAILY)
+        if self.weekly_halted:
+            active.append(HALT_WEEKLY)
+        return tuple(active)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "flat": self.flat,
+            "daily_halted": self.daily_halted,
+            "weekly_halted": self.weekly_halted,
+            "entries_blocked": self.entries_blocked,
+            "reasons": list(self.reasons),
+        }
+
+
+@dataclass(frozen=True)
+class CloseOrderPlan:
+    """What the executor must do to flatten one position. This module never places it."""
+
+    coin: str
+    sleeve: Sleeve | None
+    size_pct: float
+    reason: str
+    order_type: str = CLOSE_ORDER_TYPE
+    venue: str = "kraken"
+    dry_run: bool = True
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "coin": self.coin,
+            "sleeve": self.sleeve.value if isinstance(self.sleeve, Sleeve) else self.sleeve,
+            "size_pct": self.size_pct,
+            "order_type": self.order_type,
+            "venue": self.venue,
+            "reason": self.reason,
+            "dry_run": self.dry_run,
+        }
+
+
+@dataclass(frozen=True)
+class KillSwitchStatus:
+    """The kill switch's full state, as reported to the CLI, Telegram and the ledger."""
+
+    state: HaltState
+    entries_blocked: bool
+    reasons: tuple[str, ...]
+    positions_to_close: tuple[str, ...]
+    daily_halt_expires_at: datetime | None
+    weekly_halt_requires_human_restart: bool
+    resumed_by_human: bool = False
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "flat": self.state.flat,
+            "daily_halted": self.state.daily_halted,
+            "weekly_halted": self.state.weekly_halted,
+            "entries_blocked": self.entries_blocked,
+            "reasons": list(self.reasons),
+            "positions_to_close": list(self.positions_to_close),
+            "daily_halt_expires_at": (
+                self.daily_halt_expires_at.isoformat()
+                if self.daily_halt_expires_at is not None
+                else None
+            ),
+            "weekly_halt_requires_human_restart": self.weekly_halt_requires_human_restart,
+            "resumed_by_human": self.resumed_by_human,
+        }
+
+
+def _settings_timezone() -> ZoneInfo:
+    try:
+        return ZoneInfo(load_settings().timezone)
+    except Exception:  # pragma: no cover - a broken config is a startup failure elsewhere
+        return ZoneInfo("UTC")
+
+
+def next_reset(moment: datetime, reset_at: str = "00:00") -> datetime:
+    """The next occurrence of ``reset_at`` (``HH:MM``) in the settings timezone, as aware UTC."""
+    tz = _settings_timezone()
+    local = moment.astimezone(tz)
+    hour, minute = (int(part) for part in reset_at.split(":"))
+    candidate = local.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= local:
+        candidate = candidate + timedelta(days=1)
+    return candidate.astimezone(UTC)
+
+
+class KillSwitch:
+    """The kill switch state machine. Inject the clock with ``now=`` for deterministic tests."""
+
+    def __init__(
+        self,
+        limits: RiskLimits,
+        ledger: LedgerStore | None = None,
+        *,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        self.limits = limits
+        self.ledger = ledger
+        self._clock: Callable[[], datetime] = now or (lambda: datetime.now(UTC))
+        self._flat_at: datetime | None = None
+        self._daily_halt_at: datetime | None = None
+        self._weekly_halt_at: datetime | None = None
+        self._pending_closes: tuple[str, ...] = ()
+        self._last_reason: str | None = None
+        self._resumed_by_human = False
+
+    # -- clock and state -----------------------------------------------------------------------
+
+    def now(self) -> datetime:
+        """The injected instant, always aware and in UTC."""
+        moment = self._clock()
+        return moment if moment.tzinfo is not None else moment.replace(tzinfo=UTC)
+
+    def _daily_halt_active(self) -> bool:
+        if self._daily_halt_at is None:
+            return False
+        expires = next_reset(self._daily_halt_at, self.limits.halts.daily_halt_resets_at)
+        return self.now() < expires
+
+    def daily_halt_expires_at(self) -> datetime | None:
+        """When the daily halt clears itself, or ``None`` when it is not active."""
+        if not self._daily_halt_active():
+            return None
+        assert self._daily_halt_at is not None
+        return next_reset(self._daily_halt_at, self.limits.halts.daily_halt_resets_at)
+
+    def halt_state(self) -> HaltState:
+        """The flags the Risk Gate consumes."""
+        return HaltState(
+            flat=self._flat_at is not None,
+            daily_halted=self._daily_halt_active(),
+            weekly_halted=self._weekly_halt_at is not None,
+        )
+
+    def status(self) -> KillSwitchStatus:
+        state = self.halt_state()
+        return KillSwitchStatus(
+            state=state,
+            entries_blocked=state.entries_blocked,
+            reasons=state.reasons,
+            positions_to_close=self._pending_closes,
+            daily_halt_expires_at=self.daily_halt_expires_at(),
+            weekly_halt_requires_human_restart=self.limits.halts.weekly_halt_requires_human_restart,
+            resumed_by_human=self._resumed_by_human,
+        )
+
+    def is_entry_blocked(self) -> bool:
+        return self.halt_state().entries_blocked
+
+    # -- triggers ------------------------------------------------------------------------------
+
+    def trigger_flat(
+        self,
+        *,
+        actor: str = "human",
+        reason: str = "human /flat",
+        positions: Sequence[object] = (),
+        cycle_id: str | None = None,
+    ) -> KillSwitchStatus:
+        """``/flat``: close every position and block new entries until a resume."""
+        self._flat_at = self.now()
+        self._last_reason = reason
+        self._resumed_by_human = False
+        self._pending_closes = self._coins(positions)
+        self._record_human_action(COMMAND_FLAT, actor, cycle_id)
+        return self.status()
+
+    def trigger_daily_halt(
+        self,
+        *,
+        actor: str = RISK_GATE_ROLE,
+        reason: str = "daily loss halt",
+        positions: Sequence[object] = (),
+        cycle_id: str | None = None,
+    ) -> KillSwitchStatus:
+        """The daily loss halt: close every position and block entries for the rest of the day."""
+        if self._daily_halt_at is None:
+            self._daily_halt_at = self.now()
+        self._last_reason = reason
+        self._pending_closes = self._coins(positions)
+        self._record_human_action(COMMAND_PAUSE, actor, cycle_id)
+        return self.status()
+
+    def trigger_weekly_halt(
+        self,
+        *,
+        actor: str = RISK_GATE_ROLE,
+        reason: str = "weekly drawdown halt",
+        positions: Sequence[object] = (),
+        cycle_id: str | None = None,
+    ) -> KillSwitchStatus:
+        """The weekly drawdown halt: blocked until a **human** restart, never cleared by code."""
+        if self._weekly_halt_at is None:
+            self._weekly_halt_at = self.now()
+        self._last_reason = reason
+        self._pending_closes = self._coins(positions)
+        self._record_human_action(COMMAND_PAUSE, actor, cycle_id)
+        return self.status()
+
+    def resume(
+        self,
+        *,
+        actor: str = "human",
+        human: bool = True,
+        cycle_id: str | None = None,
+    ) -> KillSwitchStatus:
+        """Clear the halts. The weekly drawdown halt clears **only** on a human restart.
+
+        ``human=False`` is the automatic path (a scheduled job, an agent); it clears ``/flat`` and the
+        daily halt but leaves the weekly halt standing, which is the point of the rule.
+        """
+        self._flat_at = None
+        self._daily_halt_at = None
+        cleared_weekly = False
+        if human or not self.limits.halts.weekly_halt_requires_human_restart:
+            cleared_weekly = self._weekly_halt_at is not None
+            self._weekly_halt_at = None
+        self._pending_closes = ()
+        self._resumed_by_human = bool(human and cleared_weekly)
+        self._record_human_action(COMMAND_RESUME, actor, cycle_id)
+        return self.status()
+
+    # -- automatic triggers --------------------------------------------------------------------
+
+    def evaluate(
+        self,
+        *,
+        daily_loss_used_pct: float = 0.0,
+        drawdown_used_pct: float = 0.0,
+        positions: Sequence[object] = (),
+        cycle_id: str | None = None,
+    ) -> KillSwitchStatus:
+        """Fire the halts the numbers demand. Called once per cycle before the Risk Gate runs."""
+        if daily_loss_used_pct >= self.limits.halts.daily_loss_halt_pct:
+            self.trigger_daily_halt(
+                reason=(
+                    f"daily loss {daily_loss_used_pct:.2f}% >= "
+                    f"{self.limits.halts.daily_loss_halt_pct:.2f}%"
+                ),
+                positions=positions,
+                cycle_id=cycle_id,
+            )
+        if drawdown_used_pct >= self.limits.halts.weekly_drawdown_halt_pct:
+            self.trigger_weekly_halt(
+                reason=(
+                    f"drawdown {drawdown_used_pct:.2f}% >= "
+                    f"{self.limits.halts.weekly_drawdown_halt_pct:.2f}%"
+                ),
+                positions=positions,
+                cycle_id=cycle_id,
+            )
+        return self.status()
+
+    # -- closing positions ---------------------------------------------------------------------
+
+    def close_all_orders(
+        self,
+        positions: Sequence[object],
+        *,
+        reason: str | None = None,
+    ) -> list[CloseOrderPlan]:
+        """The plans that flatten every position. Paper only: nothing here is ever placed.
+
+        The module has no exchange client and ``dry_run`` is always ``True``, so a halt can close a
+        paper book and nothing else.
+        """
+        why = reason or self._last_reason or "kill switch"
+        return [
+            CloseOrderPlan(
+                coin=self._coin(position),
+                sleeve=self._sleeve(position),
+                size_pct=self._size(position),
+                reason=why,
+            )
+            for position in positions
+        ]
+
+    # -- helpers -------------------------------------------------------------------------------
+
+    @staticmethod
+    def _coin(position: object) -> str:
+        for attribute in ("coin", "pair", "symbol"):
+            value = getattr(position, attribute, None)
+            if value:
+                return str(value)
+        if isinstance(position, dict):
+            for key in ("coin", "pair", "symbol"):
+                if position.get(key):
+                    return str(position[key])
+        return str(position)
+
+    @staticmethod
+    def _sleeve(position: object) -> Sleeve | None:
+        value = getattr(position, "sleeve", None)
+        if value is None and isinstance(position, dict):
+            value = position.get("sleeve")
+        if isinstance(value, Sleeve):
+            return value
+        try:
+            return Sleeve(str(value)) if value is not None else None
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _size(position: object) -> float:
+        value = getattr(position, "size_pct", None)
+        if value is None and isinstance(position, dict):
+            value = position.get("size_pct")
+        try:
+            return float(value) if value is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _coins(self, positions: Sequence[object]) -> tuple[str, ...]:
+        return tuple(self._coin(position) for position in positions)
+
+    def _record_human_action(self, command: str, actor: str, cycle_id: str | None) -> str | None:
+        """Write the human action to the ledger. A kill switch command is always in time."""
+        if self.ledger is None:
+            return None
+        moment = self.now()
+        payload = HumanActionPayload(
+            decision_card_id=None,
+            command=command,
+            actor=actor,
+            responded_at=moment,
+            within_window=True,
+        )
+        resolved_cycle = cycle_id or f"kill-switch-{moment.strftime('%Y-%m-%dT%H:%MZ')}"
+        return self.ledger.write(
+            Stage.HUMAN_ACTION, resolved_cycle, payload, producer_role=actor
+        )
+
+
+__all__ = [
+    "CLOSE_ORDER_TYPE",
+    "COMMAND_FLAT",
+    "COMMAND_PAUSE",
+    "COMMAND_RESUME",
+    "CloseOrderPlan",
+    "HALT_DAILY",
+    "HALT_FLAT",
+    "HALT_WEEKLY",
+    "HaltState",
+    "KillSwitch",
+    "KillSwitchStatus",
+    "RISK_GATE_ROLE",
+    "VENUE_WRITES_ENABLED",
+    "next_reset",
+]
