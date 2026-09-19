@@ -64,6 +64,18 @@ RULE_MAX_ENTRY_ADJUSTMENT = "max_entry_position_adjustment_exceeded"
 #: A reprice beyond ``risk_limits.execution.max_reprices``.
 RULE_MAX_REPRICES = "max_reprices_exceeded"
 
+#: A REST call that needs a trade id and could not resolve one from the venue.
+RULE_NO_OPEN_POSITION = "no_open_position_for_pair"
+
+#: The trade an exit or a cancel refers to is not on the venue (any more).
+RULE_UNKNOWN_TRADE = "unknown_trade_id"
+
+#: The order the exit would place is below the venue's minimum order size.
+RULE_BELOW_MIN_ORDER_SIZE = "below_min_order_size"
+
+#: A limit price too far from the venue's own last price to be a real post-only order.
+RULE_PRICE_AWAY_FROM_MARKET = "price_away_from_market"
+
 #: The rejected vocabulary, verbatim from ``agentoquant/enums.py``.
 REJECTED_EXECUTION_ACTIONS: tuple[str, ...] = tuple(REJECTED_ACTIONS)
 
@@ -119,6 +131,19 @@ class UnsupportedActionError(ValueError):
         self.rule_fired = rule_fired
         self.action_name = getattr(action, "value", str(action))
         super().__init__(message or f"{self.action_name}: {rule_fired}")
+
+
+class OrderNotPlacedError(RuntimeError):
+    """An intent that reached the venue and was refused before any order existed.
+
+    Carries the named rule that fired so the loop can record a refusal instead of a crash: a missing
+    trade id, a size below the venue's minimum, a price the venue would not accept.
+    """
+
+    def __init__(self, intent: OrderIntent, *, rule_fired: str, message: str | None = None) -> None:
+        self.intent = intent
+        self.rule_fired = rule_fired
+        super().__init__(message or f"{intent.action.value} ({intent.freqtrade_call}): {rule_fired}")
 
 
 def is_rejected_action(action: Any) -> bool:
@@ -382,6 +407,11 @@ class _FreqtradeDryRunTransport:
     #: The calls freqtrade's REST API exposes directly.
     REST_CALLS: frozenset[str] = frozenset({"forceenter", "forceexit", "cancel_open_order"})
 
+    #: The REST parameter that carries the trade id for each call that needs one. ``forceexit`` and
+    #: ``cancel_open_order`` cannot be called without it, and the manager does not know it: the
+    #: pipeline addresses pairs, the venue addresses trade ids, so the transport resolves it.
+    REST_TRADE_ID_ARGS: dict[str, str] = {"forceexit": "tradeid", "cancel_open_order": "trade_id"}
+
     #: REST argument names that stand in for the strategy hook's names.
     KWARG_ALIASES: dict[str, str] = {
         "custom_entry_price": "price",
@@ -389,6 +419,7 @@ class _FreqtradeDryRunTransport:
         "entry_tag": "enter_tag",
         "stakeamount": "stake_amount",
         "trade_id": "tradeid",
+        "order_id": "trade_id",
     }
 
     def __init__(self, client: Any, base_url: str) -> None:
@@ -414,22 +445,54 @@ class _FreqtradeDryRunTransport:
         call = intent.freqtrade_call.split("+")[0]
         return call in self.REST_CALLS and callable(getattr(self._client, call, None))
 
+    @staticmethod
+    def _accepted(handler: Any) -> set[str]:
+        """The parameter names ``handler`` actually takes. Never guesses on a builtin."""
+        try:
+            accepted = set(inspect.signature(handler).parameters)
+        except (TypeError, ValueError):  # pragma: no cover - a builtin or a C callable
+            return set()
+        accepted.discard("self")
+        return accepted
+
     def _rest_kwargs(self, handler: Any, intent: OrderIntent) -> dict[str, Any]:
-        """Map the hook's argument names onto the REST call's, and keep only what it accepts."""
+        """Map the hook's argument names onto the REST call's, and keep only what it accepts.
+
+        Every key is filtered against the handler's own signature, ``pair`` included: freqtrade's
+        ``forceexit`` and ``cancel_open_order`` take a trade id and no pair, and passing one anyway
+        raises ``TypeError`` before any order is placed.
+        """
         kwargs = dict(intent.freqtrade_kwargs)
         pair = kwargs.pop("pair", intent.pair)
         for alias, name in self.KWARG_ALIASES.items():
             if alias in kwargs and name not in kwargs:
                 kwargs[name] = kwargs.pop(alias)
-        try:
-            accepted = set(inspect.signature(handler).parameters)
-        except (TypeError, ValueError):  # pragma: no cover - a builtin or a C callable
-            accepted = set(kwargs)
-        accepted.discard("self")
+        accepted = self._accepted(handler)
+        if not accepted:  # pragma: no cover - a builtin handler cannot be introspected
+            return dict(kwargs)
         filtered = {k: v for k, v in kwargs.items() if k in accepted and v is not None}
-        if pair is not None:
+        if pair is not None and "pair" in accepted:
             filtered["pair"] = pair
         return filtered
+
+    def open_trade_id(self, pair: str | None) -> Any:
+        """The venue's own open trade id for ``pair``, or ``None``.
+
+        ``status`` is the only endpoint that maps a pair to the trade the venue is holding, so the
+        id is read from there rather than guessed or fabricated.
+        """
+        if not pair:
+            return None
+        try:
+            trades = self._client.status()
+        except Exception:
+            return None
+        for row in trades or []:
+            if not isinstance(row, dict):
+                continue
+            if row.get("pair") == pair and row.get("is_open", True):
+                return row.get("trade_id")
+        return None
 
     def submit(self, intent: OrderIntent) -> dict[str, Any]:
         call = intent.freqtrade_call.split("+")[0]
@@ -440,6 +503,21 @@ class _FreqtradeDryRunTransport:
             )
         handler = getattr(self._client, call)
         kwargs = self._rest_kwargs(handler, intent)
+        accepted = self._accepted(handler)
+        id_arg = self.REST_TRADE_ID_ARGS.get(call)
+        if id_arg and id_arg in accepted and kwargs.get(id_arg) is None:
+            pair = intent.freqtrade_kwargs.get("pair") or intent.pair
+            trade_id = self.open_trade_id(pair)
+            if trade_id is None:
+                raise OrderNotPlacedError(
+                    intent,
+                    rule_fired=RULE_NO_OPEN_POSITION,
+                    message=(
+                        f"{call} needs a trade id and the venue holds no open trade for {pair!r} "
+                        f"(rule {RULE_NO_OPEN_POSITION})"
+                    ),
+                )
+            kwargs[id_arg] = trade_id
         result = handler(**kwargs)
         if isinstance(result, dict):
             return result
@@ -1264,16 +1342,21 @@ __all__ = [
     "ORDER_TYPES",
     "OrderIntent",
     "OrderManager",
+    "OrderNotPlacedError",
     "OrderTransport",
     "PARTIAL_EXIT_FRACTIONS",
     "REBALANCE_HOUR",
     "REBALANCE_WEEKDAY",
     "REJECTED_EXECUTION_ACTIONS",
+    "RULE_BELOW_MIN_ORDER_SIZE",
     "RULE_MARKET_ORDER_NOT_ALLOWED",
     "RULE_MAX_ENTRY_ADJUSTMENT",
     "RULE_MAX_REPRICES",
+    "RULE_NO_OPEN_POSITION",
+    "RULE_PRICE_AWAY_FROM_MARKET",
     "RULE_REJECTED_ACTION",
     "RULE_UNKNOWN_ACTION",
+    "RULE_UNKNOWN_TRADE",
     "STATUSES",
     "SIZE_FREE_PATHS",
     "UnsupportedActionError",
