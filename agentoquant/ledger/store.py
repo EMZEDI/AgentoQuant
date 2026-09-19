@@ -151,6 +151,19 @@ TABLE_COLUMNS: dict[Stage, list[tuple[str, str]]] = {
 #: Stage value -> table name (they are the same string, kept explicit so nothing guesses).
 STAGE_TABLES: dict[Stage, str] = {stage: stage.value for stage in Stage}
 
+#: Stages whose write is idempotent on a natural key, and the key.
+#:
+#: ``risk_gate_verdict`` has **two** writers for one decision: the gate writes its own verdict
+#: (``risk/gate.py``) and the hourly loop writes back the verdict it was handed
+#: (``execution/paper.py``). One cycle therefore landed as two rows, so ``COUNT(*) ... GROUP BY
+#: cycle_id`` double-counted the stage and the gate stopped being idempotent as a side effect (a
+#: re-evaluation after a config reload wrote a second verdict for one decision). The natural key is
+#: ``(cycle_id, decision_card_id)``: a second write with an identical payload is a no-op that returns
+#: the first record's id, and a second write that disagrees is refused rather than silently dropped.
+STAGE_NATURAL_KEYS: dict[Stage, tuple[str, ...]] = {
+    Stage.RISK_GATE_VERDICT: ("cycle_id", "decision_card_id"),
+}
+
 
 # ----------------------------------------------------------------------------------------------
 # Value conversion
@@ -309,6 +322,11 @@ class LedgerStore:
                     f"({env[name]!r} vs {body[name]!r})"
                 )
         row = {**env, **body}
+        natural_key = STAGE_NATURAL_KEYS.get(stage)
+        if natural_key is not None:
+            existing_id = self._dedupe_on_natural_key(stage, natural_key, body_model, row)
+            if existing_id is not None:
+                return existing_id
         columns = TABLE_COLUMNS[stage]
         names = ", ".join(f'"{name}"' for name, _ in columns)
         placeholders = ", ".join("?" for _ in columns)
@@ -343,6 +361,47 @@ class LedgerStore:
                 f"{len(exc.errors())} validation error(s); first: {exc.errors()[0].get('loc')} "
                 f"{exc.errors()[0].get('msg')}"
             ) from exc
+
+    def _dedupe_on_natural_key(
+        self,
+        stage: Stage,
+        key_columns: tuple[str, ...],
+        body_model: LedgerPayload,
+        row: dict[str, Any],
+    ) -> str | None:
+        """The existing record's id when this stage's natural key is already in the table, else ``None``.
+
+        Returns the first record's ``record_id`` when the stored payload is identical to the one
+        being written (so a second writer for one decision is a no-op rather than a second row).
+        Raises :class:`LedgerWriteError` when the table already holds a *different* payload under
+        the same key: keeping the first of two disagreeing verdicts for one card would hide a
+        re-evaluation instead of recording it, so the conflict is refused loudly.
+        """
+        where = " AND ".join(f'"{name}" = ?' for name in key_columns)
+        stored_rows = self.query(
+            f'SELECT * FROM "{STAGE_TABLES[stage]}" WHERE {where}',
+            [_to_db(row[name]) for name in key_columns],
+        )
+        if not stored_rows:
+            return None
+        payload_columns = [
+            name for name, _ in TABLE_COLUMNS[stage] if name not in ENVELOPE_COLUMNS
+        ]
+        body = body_model.model_dump(mode="json")
+        key_values = {name: row[name] for name in key_columns}
+        for stored in stored_rows:
+            conflicts = {
+                name: (stored.get(name), body.get(name))
+                for name in payload_columns
+                if stored.get(name) != body.get(name)
+            }
+            if not conflicts:
+                return str(stored["record_id"])
+        raise LedgerWriteError(
+            f"stage {stage.value}: a record for {key_values} already exists with a different "
+            f"payload ({', '.join(sorted(conflicts))}); one decision gets one {stage.value} record, "
+            "so a re-evaluation must replace it explicitly rather than add a second row"
+        )
 
     # -- read --------------------------------------------------------------------------------
 
@@ -531,6 +590,7 @@ __all__ = [
     "HORIZON_DURATIONS",
     "OUTCOME_HORIZONS",
     "STAGE_TABLES",
+    "STAGE_NATURAL_KEYS",
     "TABLE_COLUMNS",
     "LedgerError",
     "LedgerSchemaError",
