@@ -22,6 +22,7 @@ One row per action in :data:`EXECUTION_PATHS`. The rules the plan fixes:
 
 from __future__ import annotations
 
+import inspect
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -318,6 +319,8 @@ class OrderTransport(Protocol):
 
     def available(self) -> bool: ...
 
+    def supports(self, intent: OrderIntent) -> bool: ...
+
     def submit(self, intent: OrderIntent) -> dict[str, Any]: ...
 
 
@@ -332,6 +335,9 @@ class NullTransport:
         self.reason = reason
 
     def available(self) -> bool:
+        return False
+
+    def supports(self, intent: OrderIntent) -> bool:
         return False
 
     def submit(self, intent: OrderIntent) -> dict[str, Any]:
@@ -364,37 +370,77 @@ def freqtrade_dry_run_transport(
 
 
 class _FreqtradeDryRunTransport:
-    """Submits the REST-backed calls to a dry-run freqtrade. Strategy-hook paths are not REST calls."""
+    """Submits the calls freqtrade's REST API exposes. Hook-only paths run inside the strategy.
+
+    ``freqtrade_client`` 2026.8 exposes ``forceenter``, ``forceexit`` and ``cancel_open_order``, and
+    nothing for ``adjust_trade_position``, ``custom_stoploss``, ``custom_exit`` or ``amend_order``.
+    Those are interface version 3 strategy hooks, so the bridge strategy runs them in-process and the
+    pipeline learns what happened from the ack. :meth:`supports` is how the manager tells the two
+    apart, and it never guesses.
+    """
 
     #: The calls freqtrade's REST API exposes directly.
-    REST_CALLS: frozenset[str] = frozenset(
-        {"forceenter", "forceexit", "stoploss_on_exchange", "cancel_open_order", "amend_order"}
-    )
+    REST_CALLS: frozenset[str] = frozenset({"forceenter", "forceexit", "cancel_open_order"})
+
+    #: REST argument names that stand in for the strategy hook's names.
+    KWARG_ALIASES: dict[str, str] = {
+        "custom_entry_price": "price",
+        "custom_exit_price": "price",
+        "entry_tag": "enter_tag",
+        "stakeamount": "stake_amount",
+        "trade_id": "tradeid",
+    }
 
     def __init__(self, client: Any, base_url: str) -> None:
         self._client = client
         self.base_url = base_url
 
     def available(self) -> bool:
+        """Whether the dry-run API answers.
+
+        ``ping`` reports an unreachable API as ``{"status": "not_running"}`` rather than raising, so
+        the response itself is inspected instead of trusting the call not to fail.
+        """
         try:
-            self._client.ping()
+            result = self._client.ping()
         except Exception:
             return False
-        return True
+        if isinstance(result, dict):
+            return str(result.get("status", "")).lower() == "pong"
+        return False
+
+    def supports(self, intent: OrderIntent) -> bool:
+        """Whether the REST API can place this intent. Hook-only paths are run by the strategy."""
+        call = intent.freqtrade_call.split("+")[0]
+        return call in self.REST_CALLS and callable(getattr(self._client, call, None))
+
+    def _rest_kwargs(self, handler: Any, intent: OrderIntent) -> dict[str, Any]:
+        """Map the hook's argument names onto the REST call's, and keep only what it accepts."""
+        kwargs = dict(intent.freqtrade_kwargs)
+        pair = kwargs.pop("pair", intent.pair)
+        for alias, name in self.KWARG_ALIASES.items():
+            if alias in kwargs and name not in kwargs:
+                kwargs[name] = kwargs.pop(alias)
+        try:
+            accepted = set(inspect.signature(handler).parameters)
+        except (TypeError, ValueError):  # pragma: no cover - a builtin or a C callable
+            accepted = set(kwargs)
+        accepted.discard("self")
+        filtered = {k: v for k, v in kwargs.items() if k in accepted and v is not None}
+        if pair is not None:
+            filtered["pair"] = pair
+        return filtered
 
     def submit(self, intent: OrderIntent) -> dict[str, Any]:
         call = intent.freqtrade_call.split("+")[0]
-        if call not in self.REST_CALLS:
+        if not self.supports(intent):
             raise NotImplementedError(
                 f"{intent.freqtrade_call} is a strategy hook, not a REST call; "
                 "the bridge strategy runs it in-process"
             )
-        handler = getattr(self._client, call, None)
-        if handler is None:
-            raise NotImplementedError(f"freqtrade client has no {call!r}")
-        kwargs = dict(intent.freqtrade_kwargs)
-        pair = kwargs.pop("pair", intent.pair)
-        result = handler(pair=pair, **kwargs)
+        handler = getattr(self._client, call)
+        kwargs = self._rest_kwargs(handler, intent)
+        result = handler(**kwargs)
         if isinstance(result, dict):
             return result
         return {"status": STATUS_FILLED if result else STATUS_UNFILLED_TIMEOUT, "raw": result}
@@ -1091,6 +1137,22 @@ class OrderManager:
         reports: list[dict[str, Any]] = []
         for intent in plan.intents:
             assert_order_type_allowed(intent.order_type, intent.purpose, limits=self.execution_limits)
+            if not self._supports(intent):
+                # The REST API has no endpoint for this hook, so the strategy runs it in-process. No
+                # execution record is written here: the order was never placed by this call.
+                reports.append(
+                    {
+                        "cycle_id": cycle_id,
+                        "action": intent.action.value,
+                        "path": intent.path,
+                        "freqtrade_call": intent.freqtrade_call,
+                        "submitted": False,
+                        "reason": "strategy hook: the bridge strategy runs it in-process",
+                        "status": None,
+                        "record_id": None,
+                    }
+                )
+                continue
             report = self.transport.submit(intent)
             reports.append(
                 self._record(
@@ -1101,6 +1163,13 @@ class OrderManager:
                 )
             )
         return reports
+
+    def _supports(self, intent: OrderIntent) -> bool:
+        """Whether the transport can place this intent itself."""
+        supporter = getattr(self.transport, "supports", None)
+        if callable(supporter):
+            return bool(supporter(intent))
+        return True
 
     def _record(
         self,
@@ -1129,6 +1198,7 @@ class OrderManager:
         )
         row: dict[str, Any] = {
             "cycle_id": cycle_id,
+            "submitted": True,
             "action": intent.action.value,
             "path": intent.path,
             "freqtrade_call": intent.freqtrade_call,
