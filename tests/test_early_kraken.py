@@ -126,7 +126,8 @@ def state_path(tmp_path: Any) -> Path:
 def test_parse_rss_pubdate_reads_rfc822_and_rejects_the_rest() -> None:
     assert parse_rss_pubdate("Wed, 16 Sep 2026 18:48:58 +0000") == PUBLISHED_AT
     assert parse_rss_pubdate("Wed, 16 Sep 2026 20:48:58 +0200") == PUBLISHED_AT
-    for unusable in [None, "", "   ", "not a date", "32 Foo 2026 99:99:99 +0000", 42, []]:
+    # The parameter is typed str | None (it comes from an XML text node); anything unusable is None.
+    for unusable in [None, "", "   ", "not a date", "32 Foo 2026 99:99:99 +0000"]:
         assert parse_rss_pubdate(unusable) is None, unusable
 
 
@@ -224,9 +225,13 @@ def test_parse_asset_pairs_tolerates_missing_fields() -> None:
 
 
 def test_pair_ticker_prefers_the_wsname_and_normalises_aliases() -> None:
+    """Both spellings of the legacy BTC/DOGE codes normalise; a regression here writes a Kraken code."""
     assert pair_ticker({"wsname": "TREAD/USD", "base": "TREAD", "quote": "ZUSD"}) == "TREAD"
+    assert pair_ticker({"wsname": "XBT/USD", "base": "XXBT", "quote": "ZUSD"}) == "BTC"
     assert pair_ticker({"wsname": "", "base": "XXBT", "quote": "ZUSD"}) == "BTC"
-    assert pair_ticker({"wsname": "XDG/USD", "base": "XDG", "quote": "ZUSD"}) == "DOGE"
+    assert pair_ticker({"wsname": "", "base": "XBT", "quote": "ZUSD"}) == "BTC"
+    assert pair_ticker({"wsname": "XDG/USD", "base": "XXDG", "quote": "ZUSD"}) == "DOGE"
+    assert pair_ticker({"wsname": "", "base": "XXDG", "quote": "ZUSD"}) == "DOGE"
     assert pair_ticker({"wsname": "", "base": "", "quote": "ZUSD"}) is None
 
 
