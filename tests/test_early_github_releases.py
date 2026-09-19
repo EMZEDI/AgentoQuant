@@ -228,7 +228,7 @@ def test_one_dead_repo_does_not_hide_a_live_one(tmp_path: Any, monkeypatch: Any)
 
     failed = log_events(writer.log, "repo_failed")
     assert [record["repo"] for record in failed] == [MISSING_REPO]
-    assert "FetchError" in failed[0]["error"]
+    assert "HTTP 404" in failed[0]["error"]
     assert [call[1] for call in fetcher.calls] == [GOOD_REPO_PATH, MISSING_REPO_PATH]
 
 
