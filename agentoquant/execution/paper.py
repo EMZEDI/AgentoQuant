@@ -282,7 +282,9 @@ def run_cycle(
         "path": plan.path,
         "intents": len(plan.intents),
         "orders": sum(1 for r in reports if r.get("submitted")),
-        "strategy_paths": sum(1 for r in reports if not r.get("submitted")),
+        "strategy_paths": sum(1 for r in reports if r.get("handled_by") == "strategy"),
+        "refused": sum(1 for r in reports if r.get("rule_fired")),
+        "errors": sum(1 for r in reports if r.get("error")),
         "fills": sum(1 for r in reports if r.get("status") == "filled"),
         "fees_paid": round(sum(float(r.get("fee_paid") or 0.0) for r in reports), 10),
         "fee_tier": fee_tiers.current_tier,
@@ -303,6 +305,8 @@ def run_cycle(
                 "freqtrade_call": r.get("freqtrade_call"),
                 "submitted": bool(r.get("submitted")),
                 "status": r.get("status"),
+                "reason": r.get("reason"),
+                "rule_fired": r.get("rule_fired"),
             }
             for r in reports
         ],
@@ -465,7 +469,10 @@ def main(cycle_id: str | None = None, placeholder: bool = False, hours: int = 1)
                 "action": row.get("action"),
                 "verdict": row.get("verdict"),
                 "path": row.get("path"),
+                "intents": row.get("intents"),
                 "orders": row.get("orders"),
+                "refused": row.get("refused"),
+                "errors": row.get("errors"),
                 "ack": row.get("ack"),
                 "status": row.get("status"),
             }

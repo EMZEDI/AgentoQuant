@@ -1211,6 +1211,10 @@ class OrderManager:
 
         The taker-order guard runs again here, so a plan built by hand cannot slip a market order past
         the purpose rule. Nothing is submitted when the plan carries no intent.
+
+        One intent that cannot be placed never discards the others: a venue refusal is reported
+        against that intent with the rule that fired, and the remaining intents are still submitted.
+        A plan whose first slice fails must not silently swallow the rest of the ladder.
         """
         reports: list[dict[str, Any]] = []
         for intent in plan.intents:
@@ -1226,12 +1230,46 @@ class OrderManager:
                         "freqtrade_call": intent.freqtrade_call,
                         "submitted": False,
                         "reason": "strategy hook: the bridge strategy runs it in-process",
+                        "handled_by": "strategy",
                         "status": None,
                         "record_id": None,
                     }
                 )
                 continue
-            report = self.transport.submit(intent)
+            try:
+                report = self.transport.submit(intent)
+            except OrderNotPlacedError as exc:
+                # Refused before an order existed: recorded against this intent, with its rule, and
+                # the rest of the plan still runs.
+                reports.append(
+                    {
+                        "cycle_id": cycle_id,
+                        "action": intent.action.value,
+                        "path": intent.path,
+                        "freqtrade_call": intent.freqtrade_call,
+                        "submitted": False,
+                        "reason": f"{exc.rule_fired}: {exc}",
+                        "rule_fired": exc.rule_fired,
+                        "status": None,
+                        "record_id": None,
+                    }
+                )
+                continue
+            except Exception as exc:
+                reports.append(
+                    {
+                        "cycle_id": cycle_id,
+                        "action": intent.action.value,
+                        "path": intent.path,
+                        "freqtrade_call": intent.freqtrade_call,
+                        "submitted": False,
+                        "reason": f"venue_error: {type(exc).__name__}: {exc}",
+                        "error": True,
+                        "status": None,
+                        "record_id": None,
+                    }
+                )
+                continue
             reports.append(
                 self._record(
                     intent,
