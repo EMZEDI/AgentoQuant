@@ -151,6 +151,24 @@ TABLE_COLUMNS: dict[Stage, list[tuple[str, str]]] = {
 #: Stage value -> table name (they are the same string, kept explicit so nothing guesses).
 STAGE_TABLES: dict[Stage, str] = {stage: stage.value for stage in Stage}
 
+#: Stages whose write is idempotent on a natural key, and the key.
+#:
+#: ``risk_gate_verdict`` has **two** writers for one decision: the gate writes its own verdict
+#: (``risk/gate.py``) and the hourly loop writes back the verdict it was handed
+#: (``execution/paper.py``). One cycle therefore landed as two identical rows, so ``COUNT(*) ...
+#: GROUP BY cycle_id`` double-counted the stage. The natural key is ``(cycle_id,
+#: decision_card_id)``: a second write whose payload is **identical** to the stored one is a no-op
+#: that returns the first record's id.
+#:
+#: The dedupe deliberately collapses identical repeats only. It cannot collapse a *conflicting*
+#: re-evaluation, because ``decision_card_id`` is not a unique key in practice: the gate falls back
+#: to ``selected_proposal_id`` when the card has not been stored yet (``gate.py``, ``_card_id``), so
+#: two different decisions can share an id. Merging those would lose a decision's verdict, which is
+#: worse than the double count this fixes.
+STAGE_NATURAL_KEYS: dict[Stage, tuple[str, ...]] = {
+    Stage.RISK_GATE_VERDICT: ("cycle_id", "decision_card_id"),
+}
+
 
 # ----------------------------------------------------------------------------------------------
 # Value conversion
@@ -309,6 +327,11 @@ class LedgerStore:
                     f"({env[name]!r} vs {body[name]!r})"
                 )
         row = {**env, **body}
+        natural_key = STAGE_NATURAL_KEYS.get(stage)
+        if natural_key is not None:
+            existing_id = self._dedupe_on_natural_key(stage, natural_key, body_model, row)
+            if existing_id is not None:
+                return existing_id
         columns = TABLE_COLUMNS[stage]
         names = ", ".join(f'"{name}"' for name, _ in columns)
         placeholders = ", ".join("?" for _ in columns)
@@ -343,6 +366,36 @@ class LedgerStore:
                 f"{len(exc.errors())} validation error(s); first: {exc.errors()[0].get('loc')} "
                 f"{exc.errors()[0].get('msg')}"
             ) from exc
+
+    def _dedupe_on_natural_key(
+        self,
+        stage: Stage,
+        key_columns: tuple[str, ...],
+        body_model: LedgerPayload,
+        row: dict[str, Any],
+    ) -> str | None:
+        """The stored record's id when an **identical** record already holds this stage's natural key.
+
+        Returns ``None`` when the key is absent or when the stored payload differs, in which case the
+        caller writes the new row. Identical repeats are collapsed (one decision, one verdict row);
+        differing payloads are not, because a shared key is not proof of a shared decision - see
+        :data:`STAGE_NATURAL_KEYS`.
+        """
+        where = " AND ".join(f'"{name}" = ?' for name in key_columns)
+        stored_rows = self.query(
+            f'SELECT * FROM "{STAGE_TABLES[stage]}" WHERE {where}',
+            [_to_db(row[name]) for name in key_columns],
+        )
+        if not stored_rows:
+            return None
+        payload_columns = [
+            name for name, _ in TABLE_COLUMNS[stage] if name not in ENVELOPE_COLUMNS
+        ]
+        body = body_model.model_dump(mode="json")
+        for stored in stored_rows:
+            if all(stored.get(name) == body.get(name) for name in payload_columns):
+                return str(stored["record_id"])
+        return None
 
     # -- read --------------------------------------------------------------------------------
 
@@ -531,6 +584,7 @@ __all__ = [
     "HORIZON_DURATIONS",
     "OUTCOME_HORIZONS",
     "STAGE_TABLES",
+    "STAGE_NATURAL_KEYS",
     "TABLE_COLUMNS",
     "LedgerError",
     "LedgerSchemaError",
