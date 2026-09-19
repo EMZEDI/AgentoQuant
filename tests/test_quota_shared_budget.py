@@ -86,8 +86,8 @@ class MockTransport(httpx.BaseTransport):
         self.requests.append(request)
         return httpx.Response(self.status, json=self.body)
 
-    @property
     def count(self) -> int:
+        """How many requests reached this transport (a method, not a property: no decorators)."""
         return len(self.requests)
 
 
@@ -315,7 +315,7 @@ def test_an_over_budget_listener_sends_no_request(tmp_path: Path, monkeypatch: A
     written = listener.poll_once()
 
     assert written == []
-    assert transport.count == 0, "the request went out despite an exhausted budget"
+    assert transport.count() == 0, "the request went out despite an exhausted budget"
     assert listener.stats.failures == 1
     assert "quota" in (listener.stats.last_error or "")
     assert quota.breaches() == {"bybit_announcements": 1}
@@ -331,7 +331,7 @@ def test_a_listener_call_is_charged_to_its_sources_yaml_name(tmp_path: Path, mon
     listener, transport = build_listener(tmp_path, quota)
     listener.poll_once()
 
-    assert transport.count == 1
+    assert transport.count() == 1
     assert quota.used("bybit_announcements", 60) == 1
     assert quota.breaches() == {}
     assert len(call_lines(journal, "bybit_announcements")) == 1
@@ -419,7 +419,7 @@ def test_a_fetcher_without_a_manager_keeps_working_standalone(tmp_path: Path) ->
         sleep=lambda _seconds: None,
     )
     assert fetcher.get_json("/v5/announcements/index") == {"retCode": 0, "result": {"list": []}}
-    assert transport.count == 1
+    assert transport.count() == 1
 
 
 def test_a_retry_spends_a_second_unit_of_the_budget(tmp_path: Path) -> None:
@@ -439,7 +439,7 @@ def test_a_retry_spends_a_second_unit_of_the_budget(tmp_path: Path) -> None:
     with pytest.raises(FetchError):
         fetcher.get_json("/v5/announcements/index")
 
-    assert transport.count == 3
+    assert transport.count() == 3
     assert quota.used("bybit_announcements", 60) == 3
 
 
