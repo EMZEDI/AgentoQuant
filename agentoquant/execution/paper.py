@@ -331,6 +331,18 @@ def _await_ack(store: SignalStore, cycle_id: str, wait_s: float) -> dict[str, An
 # ----------------------------------------------------------------------------------------------
 
 
+def sequence_for(moment: datetime) -> int:
+    """The placeholder pattern step that belongs to ``moment``'s hour.
+
+    The pattern advances one step per cycle, and the soak runs a *fresh process* every hourly tick.
+    With a per-invocation counter each tick restarted at the first action, so a 3-day soak would
+    have exercised ``enter_laddered`` and nothing else. Anchoring the step to the hour it belongs to
+    makes the rotation stateless: consecutive ticks are one hour apart, so each lands on the next
+    action, and a single multi-hour invocation still walks forward from there.
+    """
+    return int(moment.timestamp() // 3600)
+
+
 def run_loop(
     *,
     hours: int = 1,
@@ -365,6 +377,7 @@ def run_loop(
 
     results: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
+    base_sequence = sequence_for(moment)
     for index in range(cycles):
         this_cycle = cycle_id or scheduler.cycle_id_for(moment, sequence=index + 1)
         try:
@@ -374,7 +387,7 @@ def run_loop(
                     ledger=ledger,
                     store=store,
                     transport=transport,
-                    sequence=index,
+                    sequence=base_sequence + index,
                     placeholder=placeholder,
                     notifier=notifier,
                     now=moment,
