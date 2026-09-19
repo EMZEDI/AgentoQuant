@@ -14,6 +14,9 @@ Modules:
   the exact ``usage.cost`` OpenRouter returns.
 - :mod:`agentoquant.ledger.cli` -- the ``agentoquant ledger query`` target (also the MCP tool
   ``ledger_query``).
+- :mod:`agentoquant.ledger.outcomes` -- the ``outcome`` stage's writer: ``record_due_outcomes`` writes
+  the +1h / +4h / +24h row for every card whose horizon has elapsed and has no row yet, executed,
+  rejected and vetoed alike, and is idempotent so it can run on every tick.
 
 The ledger is a single-writer store: DuckDB holds the write lock per process, so the scheduler owns
 the write path and readers open short-lived connections.
@@ -29,6 +32,7 @@ from agentoquant.ledger.schema import (
     new_ulid,
     payload_model_for,
 )
+from agentoquant.ledger.outcomes import OutcomeRecordingError, record_due_outcomes
 from agentoquant.ledger.store import (
     HORIZON_DURATIONS,
     LedgerStore,
@@ -46,8 +50,10 @@ __all__ = [
     "LedgerStore",
     "LedgerWriteError",
     "MarketBrief",
+    "OutcomeRecordingError",
     "STAGE_PAYLOAD_MODELS",
     "default_db_path",
     "new_ulid",
     "payload_model_for",
+    "record_due_outcomes",
 ]
