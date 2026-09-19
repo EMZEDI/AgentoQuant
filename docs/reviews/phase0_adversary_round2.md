@@ -575,4 +575,668 @@ The same emergency exit is charged **0.317243** in the ledger and **0.158621** b
 venue's simulated P&L is optimistic by 0.4% on every stop. Both numbers are wrong in opposite
 directions and nothing reconciles them. B9.
 
+---## Part B — new findings against the fixes
+
+Severity is judged against the same bar as round 1: **blocker** stops the checkpoint, **high** means a
+claimed acceptance criterion is false or a safety invariant is unenforced, **medium** is a real
+contained defect, **low** is hygiene or precision. Each finding names the file and line, the command I
+ran, its real output, the spec line it violates, and a suggested fix. Nothing here repeats a round-1
+finding; those are in Part A.
+
+Ranked index:
+
+| # | Finding | Severity |
+|---|---|---|
+| B1 | A `/flat` whose venue read times out closes nothing and reports a clean cycle | **blocker** |
+| B2 | Nothing in production can raise a halt: `/flat` has no trigger and the automatic halts are never driven | **high** |
+| B3 | Two processes cannot open the ledger at the same instant (`Conflicting lock is held`, uncaught) | **high** |
+| B4 | A total venue failure no longer marks the cycle degraded: `errors: 3, degraded: False`, exit 0 | **high** |
+| B5 | Strategy-level refusals (`trim_refused`, `add_refused`) never reach the cycle summary | medium |
+| B6 | The Ontario cap fails open on a coin the (non-empty) context mapping does not name | medium |
+| B7 | The staleness rule rejects an *unknown* age under a declared limit, and the loop's own age is always zero | medium |
+| B8 | Outcomes are measured from the ledger's write clock, so a replay/backfill cannot produce a historical series | medium |
+| B9 | The ledger's two-rate fee does not match what the venue charges (2x on market orders) | medium |
+| B10 | An unfilled exit records the still-open trade's amount, rate and a fee as if it had filled | medium |
+| B11 | An exit resolves its target from the card's coin, not from the venue's open position | medium |
+| B12 | The verdict-dedupe only collapses identical payloads; a conflicting repeat still writes two rows for one card | low |
+| B13 | The `reduction_cap` shrink is unobservable for `exit`, whose order is a full close whatever size is approved | low |
+| B14 | The soak's cycle log is the repo's default log path, so dev and test runs append to the acceptance evidence | low |
+| B15 | The quota journal is a second durable store, grows one line per refusal, and no tool can query it | low |
+
+---
+
+### B1 — BLOCKER: a `/flat` whose venue read times out closes nothing and reports a clean cycle
+
+**File/lines**
+- `agentoquant/execution/paper.py:302-306` — the close list is built from
+  `orders.open_positions() or [{"coin": coin} for coin in switches.status().positions_to_close]`.
+- `agentoquant/execution/order_manager.py:1014-1027` — `OrderManager.open_positions` catches
+  `Exception` and returns `[]`.
+- `agentoquant/execution/order_manager.py:526-532` — `_FreqtradeDryRunTransport._open_trades` catches
+  `Exception` and returns `[]`.
+
+**What I did.** Ran a `/flat` end to end twice against the real loop and a real `KillSwitch` whose
+state file a *fresh process* restored: once with a healthy position read, once with the read failing
+the way this venue's API actually fails (`ReadTimeout`). Then measured how often the live venue
+answers that read.
+
+**What I observed.**
+
+```
+$ .venv/bin/python /tmp/adv2/f13_checks.py
+A /flat, venue healthy: the close reaches the transport
+  healthy venue: {"intents": 0, "orders": 1, "closes": 1, "errors": 0, "venue_available": true}
+    intents the transport received: [('forceexit', 'exit', 'ETH/USD')]
+A /flat, venue read times out: the close is skipped and NOTHING reports it
+  venue read failed: {"intents": 0, "orders": 0, "closes": 0, "errors": 0, "refused": 0,
+                      "venue_available": true, "venue_error": null}
+    intents the transport received: []
+order_manager.open_positions() swallows the same exception
+  fail_positions=False: open_positions() -> [{'coin': 'ETH', 'pair': 'ETH/USD', 'trade_id': 3, 'amount': 0.015}]
+  fail_positions=True: open_positions() -> []
+```
+
+```
+$ .venv/bin/python - <<'EOF'       (live dry-run venue on localhost:8080, read-only status() calls)
+  attempt 0: status ok in 0.08s trades=[('ETH/USD', 3)]
+  attempt 1: status FAILED in 10.01s ReadTimeout
+  attempt 2: status FAILED in 10.01s ReadTimeout
+  attempt 3: status FAILED in 10.01s ReadTimeout
+  attempt 4: status FAILED in 10.01s ReadTimeout
+  attempt 5: status FAILED in 10.00s ReadTimeout
+open trades visible: 1/6 attempts
+transport.open_positions() now: []
+```
+
+**Why it matters.** This is F13's failure mode surviving the fix. With the halt raised and the venue
+read failing, `closes` is empty, no intent is submitted, `errors` is 0, `venue_error` is null,
+`degraded` is false and the process exits 0 — while every position stays open. The operator's next
+action is predicated on the flat having worked, and nothing anywhere distinguishes this cycle from a
+clean one. The condition is not exotic: the venue answered the position read **once in six attempts**
+while I was measuring, and `docs/task06_execution_report.md`'s "Not done" 4 already records a
+`ReadTimeout` during a 24-cycle burst. Round 1 asked for a control whose failure is loud; this one is
+still silent.
+
+**Spec line.** `tasks/todo.md:90` — "*Kill switch (`/flat` and daily halt) closes positions and blocks
+new entries*". Here it blocks new entries and closes nothing, and reports success.
+
+**Suggested fix.** Do not read the close list through a swallow-everything getter. Three changes, in
+order of value: (1) let the failure be visible — `open_positions()` should raise a named error (or
+return a sentinel) rather than `[]`, and `run_cycle` should record `closes_error` and keep
+`entries_blocked` true while re-trying next tick; (2) make the halt's own position list authoritative:
+`trigger_flat(positions=...)` already persists `pending_closes`, so the close list should be the union
+of the venue's open positions *and* the persisted pending closes, never only the venue's answer;
+(3) clear `flat` only after `close_all_orders` produced zero plans **and** a venue read that succeeded
+— a halt that has not confirmed a flat must stay latched, and its status must say `closes_unconfirmed`.
+
+---
+
+### B2 — HIGH: nothing in production can raise a halt
+
+**File/lines**
+- `agentoquant/execution/paper.py:245-252` — the loop builds the switch and reads `halt_state()`.
+- `agentoquant/risk/kill_switch.py:378-402` — `KillSwitch.evaluate`, the automatic daily/weekly halt.
+- `agentoquant/execution/paper.py:141-171` — `placeholder_context` never sets `daily_loss_used_pct` or
+  `drawdown_used_pct`, so the gate's own halt rules see 0.0.
+
+**What I did.** Searched the whole package for a caller of the kill switch's triggers.
+
+**What I observed.**
+
+```
+$ grep -rn "trigger_flat|build_kill_switch|kill_switch" --include=*.py agentoquant/ tests/ scripts/ | grep -v risk/kill_switch.py
+agentoquant/execution/paper.py:245:    switches = kill_switch or build_kill_switch(limits, ledger=ledger)
+agentoquant/execution/paper.py:306:        closes = switches.close_all_orders(targets, ...)
+tests/test_execution_bridge.py:1233:    switch.trigger_flat(positions=[{"coin": "BTC"}], cycle_id="flat", actor="telegram:/flat")
+scripts/task5_acceptance.py:159:plan = ks.trigger_flat(positions=positions, cycle_id=CYCLE, actor="telegram:/flat")
+$ grep -rn "\.evaluate(" --include=*.py agentoquant/ | grep -v risk/kill_switch.py
+agentoquant/execution/paper.py:254:    verdict = RiskGate(limits, ledger=ledger).evaluate(card, context)   # the gate, not the switch
+```
+
+`KillSwitch.evaluate` has no caller anywhere. `trigger_flat` is called only from a test and the
+acceptance script. The daily and weekly halts therefore cannot fire in the running system, and the
+gate's own `daily_loss_halt` / `weekly_drawdown_halt` rules cannot fire either, because the loop's
+context leaves both counters at their 0.0 defaults.
+
+**Why it matters.** Task 5's acceptance criterion names **two** triggers — "/flat **and daily halt**"
+— and the fix wired the consumption of a halt nobody can raise. The soak's three `kill_switch_flat`
+cycles in `logs/paper/cycles.jsonl` came from an agent's test burst (`cycle-flat` rows in the same
+file), not from the timer: the unattended loop has never been halted and never could be. A daily loss
+halt that no code path can trigger is a safety control that exists only in its own unit test.
+
+**Spec line.** `tasks/todo.md:90` — "*Kill switch (/flat and daily halt) closes positions and blocks
+new entries*".
+
+**Suggested fix.** Call `switches.evaluate(daily_loss_used_pct=..., drawdown_used_pct=..., positions=...,
+cycle_id=cycle_id)` once per cycle before the Risk Gate, and feed the same numbers into the
+`PortfolioContext` so the gate's halt rules and the switch cannot disagree; then wire the human path
+(`/flat`) to it — the recorded decision is that Hermes relays an inbound command to the project CLI and
+that relay writes a human action, so the smallest honest version is an `agentoquant flat` entry point
+(or a `--flat` flag on `paper`) that calls `trigger_flat` with the venue's open positions. Until one of
+these exists, `docs/phase0_status.md`'s Task 5 line should not claim the criterion is met.
+
+---
+
+### B3 — HIGH: two processes cannot open the ledger at the same instant
+
+**File/lines**
+- `agentoquant/ledger/store.py:235-239` — `_connect()` opens a fresh DuckDB connection per operation.
+- `agentoquant/ledger/store.py:229-233` — `LedgerStore.__init__` calls `migrate()`, i.e. it *opens* a
+  connection on construction, and every write/query opens another.
+
+**What I did.** Three genuinely independent processes (no fork inheritance: each is a `subprocess`
+started by a parent that holds no DuckDB handle) each write 40 rows at 1 ms intervals against one
+ledger.
+
+**What I observed.**
+
+```
+$ .venv/bin/python /tmp/adv2/conc_lock2.py
+   p0: ok=40 fail=0 first=
+   p1: CONSTRUCT FAILED IOException: IO Error: Could not set lock on file
+       "/tmp/adv2/conclock2/ledger.duckdb": Conflicting lock is held in .../python3.11 ...
+   p2: CONSTRUCT FAILED IOException: IO Error: Could not set lock on file
+       "/tmp/adv2/conclock2/ledger.duckdb": Conflicting lock is held in .../python3.11 ...
+```
+
+Two of three independent processes could not even construct a `LedgerStore` while the third was
+writing, with `_duckdb.IOException` propagating out of `migrate()` uncaught. (My first attempt at this
+test used `multiprocessing`, which forks the parent's open handle and fails for a different reason —
+this run is the clean one.)
+
+**Why it matters.** The ledger is about to be shared by design: `docs/phase0_status.md:151-156` records
+that the early-signal runner holds `data/ledger.duckdb` for its whole life and asks that this be
+settled before the runner becomes a service; the hourly ingest opens the same file on the same hourly
+boundary as the paper loop. Today the soak survives only because nothing else opens it. The failure is
+also badly shaped: it is an uncaught `IOException` at construction, so the paper loop's `run_cycle`
+would die before its own error handling, and the "one hourly snapshot" acceptance criterion would fail
+non-deterministically depending on tick alignment.
+
+**Spec line.** `plan.md:70` calls it "the ledger as the single source of truth"; a store that two
+production processes cannot open concurrently contradicts the role it is given.
+
+**Suggested fix.** Wrap `_connect()` in a bounded retry with jitter (DuckDB's lock is released as soon
+as the short-lived connection closes, so a few retries over ~2 s would absorb the collision), and do
+not open a connection in `__init__` at all — `migrate()` should be lazy or explicitly called once at
+startup. Longer term, do for the ledger what F15 did for quotas: a small `flock`-guarded write queue,
+or an explicit single-writer process. Whatever is chosen, add a test that starts two real processes and
+writes from both.
+
+---
+
+### B4 — HIGH: a total venue failure no longer marks the cycle degraded
+
+**File/lines**
+- `agentoquant/execution/order_manager.py:1541-1636` — `execute` isolates every intent, so it no longer
+  raises for a venue error.
+- `agentoquant/execution/paper.py:286-297` — `venue_error` is only set when `orders.execute` raises.
+- `agentoquant/execution/paper.py:346` — `"degraded": not venue_available and bool(plan.intents)`.
+
+**What I did.** Ran a real entry cycle whose transport raises the venue's own `ReadTimeout` on every
+submit.
+
+**What I observed.**
+
+```
+$ .venv/bin/python - <<'EOF'   (entry cycle, transport raises ReadTimeout on every submit)
+{'action': 'enter_laddered', 'verdict': 'approved', 'intents': 3, 'orders': 0, 'errors': 3,
+ 'refused': 0, 'degraded': False, 'venue_available': True, 'venue_error': None, 'ack': 'pending'}
+```
+
+**Why it matters.** Per-intent isolation is the right fix for round 1's F4 (one bad intent must not
+discard the ladder), but it removed the only signal that reported a venue outage. A cycle in which all
+three legs failed to reach the venue now reports `degraded: False`, `venue_error: null` and exit 0;
+the only trace is an `errors` counter that nothing reads — the systemd unit checks the exit code, and
+`docs/phase0_status.md`'s unattended-run evidence quotes `failures: 0`. An outage and a quiet hold look
+the same to every consumer.
+
+**Spec line.** `tasks/todo.md` Task 6's acceptance covers the loop reporting its own state honestly;
+`.hermes.md`'s operating rule for this repo is that a cycle's faults are recorded against the cycle
+rather than swallowed.
+
+**Suggested fix.** Make `degraded` a derived fact rather than a flag: `degraded = bool(errors) or
+(not venue_available and bool(plan.intents))`, and record `venue_error` from the first per-intent
+error so the message survives. Then let the soak's own report count degraded cycles.
+
+---
+
+### B5 — MEDIUM: strategy-level refusals never reach the cycle summary
+
+**File/lines**
+- `agentoquant/execution/paper.py:320` — `ack = _await_ack(store, cycle_id, ack_wait_s)`.
+- `agentoquant/execution/paper.py:335,341` — `refused` counts only `reports` (REST-level), and the ack
+  is recorded as the string `"acked"`/`"pending"` without reading its `result`.
+- `freqtrade_user_data/strategies/AgentBridgeStrategy.py:376,400,417` — the bridge writes
+  `add_refused` / `trim_refused` into the ack, with a reason.
+
+**What I did.** Wrote the ack the strategy writes for a refused trim into a scratch signal directory,
+then ran the cycle that reads it.
+
+**What I observed.**
+
+```
+$ .venv/bin/python - <<'EOF'
+cycle action: trim
+summary refused: 0 errors: 0 orders: 0 strategy_paths: 1 ack: acked
+the ack the cycle actually read: {'cycle_id': 'adv-refuse', 'acked_at': '...',
+  'result': {'action': 'trim_refused', 'pair': 'SOL/USD',
+             'reason': 'the trade holds no position to reduce'}}
+any summary key mentioning the refusal: ['cycle_id']
+```
+
+**Why it matters.** `docs/task06_execution_report.md`'s "Not done" 1 records this, and it is the same
+class of defect as F1: the cycle's own record says nothing happened and says nothing about why. Four
+of the twelve vocabulary paths run inside the strategy, so for those four the ack is the *only* report
+the loop gets — and it discards the payload. A trim that the venue refuses silently, every hour, looks
+exactly like a hold.
+
+**Spec line.** `tasks/todo.md` Task 6: orders, fills and fees logged per cycle with the cycle id; a
+refused order is not logged at all.
+
+**Suggested fix.** Classify the ack's `result.action` for the known refusal names
+(`trim_refused`, `add_refused`, and the venue-refusal shape), count them into a new
+`refused_by_strategy` key, and append the reason to the cycle record. It is a five-line change in
+`run_cycle` after `_await_ack`.
+
+---
+
+### B6 — MEDIUM: the Ontario cap fails open on a coin the context mapping does not name
+
+**File/lines**
+- `agentoquant/risk/gate.py:792-805` — `_ontario_cumulative_cad`: `if not supplied and self.ledger is
+  not None: ... return 0.0`.
+
+**What I did.** Evaluated a clean `enter_laddered` on SOL with a non-empty
+`ontario_net_buys_cad_12m` mapping that names a different coin.
+
+**What I observed.**
+
+```
+$ .venv/bin/python /tmp/adv2/final_checks.py
+  seeded fill, ledger-derived total              verdict=approved  rule=None
+  context says SOL at 31,000 CAD                 verdict=rejected  rule='ontario_net_buy_cap' final=0.0
+  non-empty mapping WITHOUT SOL (fail-open probe) verdict=approved  rule=None
+```
+
+**Why it matters.** A caller that supplies a cumulative mapping — which is exactly what a Phase 2
+ingest-fed brief would do, and what the fix report's own F9 note predicted — turns the cap off for
+every coin the mapping forgets. Unknown is read as zero, which is the same shape round 1 objected to in
+the gate's liquidity rule. Nothing in Phase 0 supplies such a mapping, so this is latent, and I state
+it as such: the *behaviour* is reproduced, the *exposure* is not currently live.
+
+**Spec line.** `config/risk_limits.yaml:48-52` states the cap is "enforced by the gate while Shahrad is
+a Canadian resident"; `tasks/todo.md:542` requires candidates to fail closed when data is missing.
+
+**Suggested fix.** When the context supplies a mapping, a coin absent from it is *unknown*, not zero:
+fall through to the ledger-derived total if a ledger is attached, and otherwise fail closed with a
+named rule (`ontario_net_buys_unknown`) rather than approving at zero.
+
+---
+
+### B7 — MEDIUM: an unknown snapshot age is rejected under a declared limit, and the loop's own age is always zero
+
+**File/lines**
+- `agentoquant/risk/gate.py:763-767` — `_market_data_max_age_s` (the context override).
+- `agentoquant/risk/gate.py:274-279` — `MarketContext.as_of` documents "the gate will not invent a
+  timestamp: an age it cannot know is not called stale".
+- `agentoquant/execution/paper.py:133-142` — `placeholder_context` sets `as_of=now` and
+  `market_data_max_age_s=market_data_max_age_s()`.
+
+**What I did.** Evaluated the same clean entry with three snapshot shapes: no declared limit and no
+timestamp, a declared limit and no timestamp, and a declared limit with a fresh timestamp.
+
+**What I observed.**
+
+```
+$ .venv/bin/python - <<'EOF'
+  no declared limit, no as_of                          verdict=approved  rule=None
+  declared limit, no as_of (Phase-2 partial snapshot)  verdict=rejected  rule=stale_market_data
+  declared limit, as_of=now                            verdict=approved  rule=None
+```
+
+**Why it matters.** Two halves of the same defect. (a) The gate's stated principle — an age it cannot
+know is not stale — holds only when the caller declares nothing; the moment a caller declares a limit
+(a Phase 2 brief that knows its cadence), *missing* timestamps become a hard reject for every coin in
+the snapshot. That is a false-reject generator aimed at exactly the caller the rule was written for.
+(b) In the loop it is the opposite: `as_of=now` is the cycle's *decision* moment, not the snapshot's
+own timestamp, so the age is identically zero and F11 can never fire in the running system — the fix
+is real in the gate and decorative in production. Neither half is a live outage today; both change
+behaviour the first time a real snapshot arrives.
+
+**Spec line.** `agentoquant/risk/gate.py`'s own `MarketContext` contract (quoted above), and Task 3's
+"every reading carries its own ts" which the brief is supposed to feed through.
+
+**Suggested fix.** Make the rule distinguish *unknown* from *old*: reject only when `as_of` is known and
+too old, or when `is_stale` is set — and if the policy is to fail closed on an unknown age, do it with
+its own named rule so an operator can tell "my data is stale" from "my data has no timestamp". On the
+loop side, stop passing the decision moment as the snapshot's timestamp: the placeholder should carry
+the timestamp of the data it actually represents, even if that means a visible fixed age, so the rule
+is exercised by something.
+
+---
+
+### B8 — MEDIUM: outcomes are measured from the ledger's write clock, so a replay cannot produce a historical series
+
+**File/lines**
+- `agentoquant/ledger/store.py:312-320` — the envelope's `ts` is `datetime.now(UTC)` at write time,
+  whatever moment the caller passed.
+- `agentoquant/ledger/store.py:469-499` — `due_outcomes` selects on `c."ts" <= cutoff`.
+- `agentoquant/execution/paper.py` — `run_cycle(now=...)` drives every *decision* from the injected
+  moment.
+
+**What I did.** Ran a cycle with an injected `now`, compared the card's stored `ts` to that moment, then
+ran the recorder at `now+1h`, `now+2h`, and finally with the card's `ts` backdated (a replay shape).
+
+**What I observed.**
+
+```
+$ .venv/bin/python /tmp/adv2/final_checks.py
+  real clock now: 2026-09-19T15:32:05.359461+00:00
+  the card's stored ts (real clock at write time): 2026-09-19 15:32:05.363501+00:00
+  the cycle's own moment (injected now)          : 2026-09-19 15:32:05.359461+00:00
+  as_of = now+1.0h: due=1 written=1
+  as_of = now+2.0h: due=1 written=1
+  and with a backdated card ts (a replay: card ts = two days ago, as_of = one day ago)
+  backdated pass: due=2 written=2
+```
+
+The stored `ts` is 4 ms *after* the cycle's own moment in production (both come from the real clock, at
+different instants), which is harmless. It stops being harmless the moment they are not the same
+clock: with `now` injected — a backfill or a replay, which Phase 1 introduces — the card is stamped
+*now* while the decision pretends to be historical, and `due_outcomes` then measures the horizon from
+the stamp. `docs/phase0_status.md:183-190` flags this as a latent inconsistency "recorded for round 2";
+my reproduction shows the consequence, namely that the *only* way to get historical outcomes out of a
+replay is the out-of-band `UPDATE` the fix report's deviation 3 admits its own tests use.
+
+**Why it matters.** Production is unaffected today (`now` defaults to the real clock and the recorder
+is right to measure from a row's write time). Phase 1's replay/backfill is exactly where it bites: a
+backfill run today would stamp every replayed card with today's date, so its "+1h outcome" is written
+the instant it is created and its P&L horizon is meaningless — silently, with a plausible-looking row.
+
+**Spec line.** `tasks/todo.md` Task 2's ledger is the decision record; `tasks/schema_scaffold_addendum.md`
+section 4's `outcome` shape carries `horizon: (1h | 4h | 24h | exit)` — a horizon relative to the
+*decision*, not to the write.
+
+**Suggested fix.** Let the caller supply the envelope timestamp (`LedgerStore.write(..., ts=...)`,
+defaulting to the real clock so every existing call site is unchanged) and have `run_cycle` pass its own
+`moment`. Then `due_outcomes` measures a real horizon in both production and replay, and the
+backdate-by-UPDATE test helper disappears.
+
+---
+
+### B9 — MEDIUM: the ledger's two-rate fee does not match what the venue charges
+
+**File/lines**
+- `agentoquant/execution/order_manager.py:752-766` — `fee_pct`, taker for `order_type in
+  TAKER_EXECUTION_TYPES or purpose in {stop_loss, emergency_exit}`.
+- `freqtrade_user_data/config.json:7` — `"fee": 0.004`, one flat rate for every simulated fill.
+- `agentoquant/execution/freqtrade_strategy.py:128-158` — `_assert_venue_fee_not_flattering` accepts
+  the maker floor and documents the exposed optimism.
+
+**What I did.** Priced the same emergency exit both ways: through the manager (what the ledger writes)
+and against the fee the venue actually charges on its own live trade.
+
+**What I observed.**
+
+```
+$ .venv/bin/python - <<'EOF'
+fee_pct market/emergency_exit: 0.8
+fee_pct post_only_limit/entry: 0.4
+fee_for(2635.74, 0.01504526, market, emergency_exit): 0.317243
+notional: 39.655394
+the venue's own fee on the live trade (fee_open from the venue status): 0.004
+```
+
+The ledger charges **0.317243** for a fill the venue charges **0.158621** (0.4% of 39.655). The venue
+under-charges relative to reality (a real taker stop costs 0.8%) and the ledger over-charges relative
+to the venue, by exactly the same factor, and nothing reconciles them. So `fee_paid` is a model, not
+the venue's number, and any P&L that mixes the two is wrong in a direction that depends on which one it
+read.
+
+**Spec line.** `tasks/schema_scaffold_addendum.md:287` defines `fee_paid` as the fee on the execution;
+`config/fee_tiers.yaml`'s Tier 1 note says "Market orders are reserved for stops and emergency exits,
+where the taker fee is the price of getting out."
+
+**Suggested fix.** Pick one source of truth for a fee and state it. The cleanest is to let the venue be
+authoritative for venue fills (read `fee_open`/`fee_close` back with the trade, as the write-back
+already reads `open_rate`) and fall back to `config/fee_tiers.yaml` only when the venue does not report
+one — then `fee_paid` is the fee that was charged, and the two-rate model is a fallback rather than a
+parallel truth.
+
+---
+
+### B10 — MEDIUM: an unfilled exit records the still-open trade's amount, rate and a fee
+
+**File/lines**
+- `agentoquant/execution/order_manager.py:645-677` — `_trade_report` fills `fill_qty`/`fill_price` from
+  the *still-open* trade and returns `status=unfilled_timeout`.
+- `agentoquant/execution/order_manager.py:1644-1690` — `_record` computes `fee_paid` unconditionally
+  from whatever `fill_price`/`fill_qty` carry.
+
+**What I did.** Ran a `/flat` close against the live dry-run venue (write call intercepted, so no order
+was placed) and read the execution row it wrote.
+
+**What I observed.**
+
+```
+$ set -a; . ~/.config/agentoquant/freqtrade.env; set +a; .venv/bin/python /tmp/adv2/venue_f13_f4.py
+  cycle: {"action": "trail_stop", "verdict": "approved", "intents": 1, "orders": 1, "closes": 1, "errors": 0}
+  execution rows: [{'cycle_id': '13Z-flat-real', 'status': 'unfilled_timeout',
+                    'fill_price': 2635.74, 'fill_qty': 0.01504526, 'fee_paid': 0.317243...}]
+  calls the client received: [('forceexit', {'tradeid': 3, 'ordertype': 'market', 'amount': None})]
+```
+
+The exit was submitted; the trade is still open; the row nevertheless carries a fill price, a fill
+quantity and a fee, under a status that says it did not fill. The fee is also charged again on every
+retry of the same position.
+
+**Why it matters.** Round 1's F1 was "a filled order recorded as unfilled". This is its mirror: an
+unfilled order recorded with fill fields and a cost. The row is internally contradictory — which of
+`fill_price`/`fee_paid`/`status` a consumer believes changes the answer — and a position that is closed
+and re-opened repeatedly by retries accumulates fees it never paid. Downstream hit-rate and cost
+accounting built on `execution` sees a fill that did not happen.
+
+**Spec line.** `tasks/schema_scaffold_addendum.md:287`: `status: str (filled | partial |
+unfilled_timeout | cancelled)` alongside `fill_price: Optional[float]` and `fee_paid: Optional[float]`
+— the fields are meant to agree with the status.
+
+**Suggested fix.** In `_record`, derive the fill fields from the status: `fill_price`/`fill_qty`/`fee_paid`
+only when the status is `filled` or `partial`, and null otherwise (keeping the observed trade value in a
+separate, clearly-named field such as `position_open_rate` if it is useful). Charge the fee when the
+venue reports the close, which the write-back can only know by reading the trade after it closes.
+
+---
+
+### B11 — MEDIUM: an exit resolves its target from the card's coin, not from the venue's open position
+
+**File/lines**
+- `agentoquant/execution/order_manager.py:1224-1252` — `_full_exit` uses `request.pair`, built from
+  `coin` (`pair_for(coin)`), and calls `forceexit` with `amount=None`.
+- `agentoquant/execution/order_manager.py:513-525` — `open_trade_id(pair)` only ever looks up the pair
+  it was handed.
+- Contrast `agentoquant/execution/paper.py:302-306` — the kill-switch path is the one place that asks
+  the venue what is open.
+
+**What I did.** Ran the placeholder's own exit cycle against the live venue, whose only open position is
+ETH/USD, and read the venue's state afterwards.
+
+**What I observed.**
+
+```
+$ .venv/bin/python /tmp/adv2/loop_checks.py
+  placeholder universe: ('BTC', 'ETH', 'SOL')
+  exit cycle summary: {"action": "exit", "verdict": "approved", "intents": 1, "orders": 0,
+                       "refused": 1}
+  venue's own open trades: [('ETH/USD', 3, True)]
+```
+
+The live soak shows the same thing twice, in its own cycle log:
+
+```
+2026-09-19T15:00:23  2026-09-19T15Z-0001  exit  approved  refused 1
+2026-09-19T15:08:48  2026-09-19T15Z-0001  exit  approved  refused 1
+```
+
+and `docs/phase0_status.md`'s own quote of the refusal:
+`no_open_position_for_pair: forceexit needs a trade id and the venue holds no open trade for 'BTC/USD'`.
+
+**Why it matters.** Refusing rather than inventing a trade id is right, and honest reporting instead of
+a `TypeError` is the F4 fix working. But the consequence is that an `exit` card whose coin does not
+match the venue's open position is a **no-op that looks like a decision**: the position stays open, the
+cycle reports a refusal with a rule nobody watches, and the loop moves on. In Phase 0 that is
+scaffolding (the placeholder's coin rotates independently of what the venue holds), and the parent is
+right that it needs a verdict one way or the other. My verdict: **the placeholder mismatch is
+scaffolding, the resolution logic is a real defect** — because nothing reconciles "the card says exit
+BTC" with "the venue holds ETH", and the only path that does reconcile (the kill switch) is the one no
+production trigger can reach (B2). A production exit that names a coin with no position should be a
+loud, named refusal that also reports *what is open* so an operator can see the disagreement.
+
+**Spec line.** `tasks/todo.md` Task 6's acceptance requires every vocabulary action to have a working
+execution path; `.hermes.md`'s rule for this repo is that the loop records its own faults honestly.
+
+**Suggested fix.** On a `no_open_position_for_pair` refusal for `exit`, include the venue's open pairs
+and their trade ids in the refusal detail, and add a check at the top of the exit path: if the card's
+coin is not among the venue's open positions but the venue holds exactly one position, that is a
+disagreement worth surfacing (a warning counter on the cycle) rather than silently refusing.
+
+---
+
+### B12 — LOW: the verdict dedupe only collapses identical payloads
+
+**File/lines** `agentoquant/ledger/store.py:370-398` (`_dedupe_on_natural_key`), `:168-170`
+(`STAGE_NATURAL_KEYS`).
+
+**What I did.** Wrote one verdict twice, then a conflicting one, then the first payload again.
+
+**What I observed.**
+
+```
+$ .venv/bin/python - <<'EOF'
+ids: True <id-A> <id-C> <id-A>
+rows: [{'verdict': 'approved', 'rule_fired': None},
+       {'verdict': 'rejected', 'rule_fired': 'kill_switch_flat'}]
+count: 2
+```
+
+**Why it matters.** The loop's two writes are the same object, so production is fixed (Part A, F2).
+But the *property* round 1 named — "a stage written twice per cycle makes `COUNT(*) ... GROUP BY
+cycle_id` wrong" — still holds whenever two evaluations of one card disagree, and the fix report says
+the gate's `_card_id` can fall back to `selected_proposal_id`, which makes a shared card id between
+genuinely different decisions a real possibility. Deliberate and argued, so this is a stated residual
+rather than a defect; but a reader of the status doc's "F2 fixed" line would not know.
+
+**Spec line.** `tasks/todo.md` Task 2's per-cycle stage ledger, which the status doc claims is
+countable.
+
+**Suggested fix.** Record the boundary where a reader will find it — one line in
+`docs/phase0_status.md` beside F2 saying the dedupe collapses identical repeats only, and that a
+conflicting repeat under one card id is a distinct decision with its own row.
+
+---
+
+### B13 — LOW: the `reduction_cap` shrink is unobservable for `exit`
+
+**File/lines**
+- `agentoquant/risk/gate.py:599-619` — `_evaluate_reducing`, the new `reduction_cap`.
+- `agentoquant/execution/order_manager.py:1244-1252` — `_full_exit` calls `forceexit` with
+  `amount=request.amount`, which the loop leaves `None`.
+- `agentoquant/execution/paper.py:271-281` — `orders.plan(...)` passes neither `amount` nor
+  `position_amount`.
+
+**What I did.** Traced what the exit plan actually places and compared it with what the gate shrinks.
+
+**What I observed.** The gate can shrink an `exit` from 3.0% to, say, 1.0% (`shrunk reduction_cap`),
+while the placed order is `forceexit(tradeid, ordertype, amount=None)` — a full close of the whole
+trade, because neither `amount` nor `position_amount` is ever supplied. Only the min-size pre-check
+changes.
+
+**Why it matters.** The new rule can only ever act as a *reject* on `exit` (position 0 in the context)
+and never as a real bound, because the executor does not consume the size it shrinks. That is not a
+safety hole — a shrink to a lower number cannot enlarge anything, and a full close is the conservative
+direction — but it means the "0 of 12 pass through" claim rests partly on a rule whose shrink arm is
+inert for one of the two actions it guards, and the same is true of `trim` if the cast ever drops
+`position_amount`. It also means a *rejected* exit is the one way an exit signal can be swallowed: an
+exit on a coin the context reports at 0% is refused outright rather than closed.
+
+**Spec line.** `.hermes.md`'s "the Risk Gate can only shrink or reject" is satisfied; the implied
+requirement that a shrink *means* something to the executor is not.
+
+**Suggested fix.** For `exit`, bound the *order* rather than the card: pass
+`amount = position_amount * final_size_pct / position_size_pct` (or refuse `exit` on a position the
+context cannot see, with a named rule) so the verdict's number reaches the venue.
+
+---
+
+### B14 — LOW: the soak's cycle log is the repo's default path, so dev and test runs append to the acceptance evidence
+
+**File/lines** `agentoquant/execution/paper.py:76-95` — `log_dir()`/`cycle_log_path()`; every
+`run_cycle(...)` without an explicit `log_path` writes there.
+
+**What I did.** Read the soak's own log and counted its cycle ids.
+
+**What I observed.**
+
+```
+$ .venv/bin/python - <<'EOF'      (logs/paper/cycles.jsonl from the main clone)
+total 22
+duplicate cycle ids: {'2026-09-19T13Z-0001': 2, 'cycle-flat': 3, 'cycle-dead': 3,
+                      '2026-09-19T15Z-0001': 2}
+2026-09-19T13:00:00+00:00  cycle-flat  enter_laddered rejected kill_switch_flat orders 1 closes 1
+2026-09-19T13:00:00+00:00  cycle-dead  enter_laddered approved None            orders 0 closes 0
+2026-09-19T13:38:12+00:00  2026-09-19T13Z-0001 add approved ...      # a burst, four rows, one timestamp
+```
+
+**Why it matters.** The file the checkpoint's "a trivial strategy runs the full hourly loop" evidence
+is read from has no isolation: `cycle-flat`/`cycle-dead` are acceptance-script and test artifacts, and
+the 13:38 burst wrote four cycles under the soak's own cycle ids with one identical `ran_at`. Counting
+rows in this file therefore over-reports the soak. The ledger has the same property (the 13:38 rows are
+in `decision_card`), though the ledger at least can be told apart by timestamp.
+
+**Spec line.** `docs/phase0_status.md`'s evidence table reads this file as the unattended run's record.
+I should also disclose that my own reproductions used a scratch ledger but no `log_path`, so rows from
+my runs are in this file too — I did not write to the soak's ledger or signal dir, but I did append to
+its cycle log. That is the defect demonstrating itself.
+
+**Suggested fix.** Give the log path an environment override (the pattern already exists for the ledger
+and the call log — `AGENTOQUANT_LEDGER_PATH`, `AGENTOQUANT_CALL_LOG`) and set
+`AGENTOQUANT_PAPER_LOG` in the systemd unit and in test fixtures; then a soak's log contains only soak
+ticks.
+
+---
+
+### B15 — LOW: the quota journal is a second durable store, growing without bound and invisible to the ledger
+
+**File/lines** `agentoquant/data/quota_manager.py:116,193-204,319-380`; default path
+`data/quota_journal.jsonl`.
+
+**What I did.** Read the journal's role against the plan, and measured its growth under exhaustion.
+
+**What I observed.**
+
+```
+$ .venv/bin/python /tmp/adv2/quota_checks.py
+  {"workers": 4, "granted_across_processes": 15, "refused_across_processes": 145,
+   "journal_lines": 160, "journal_lines_that_are_calls": 15}
+  default journal path: /home/shahrad/work/agentoquant-wt/review-round2/data/quota_journal.jsonl
+  the soak's own journal exists: True
+$ grep -n "source of truth" plan.md
+70:- Champion/challenger for models; weekly embargoed Reflector ...; the ledger as the single source of truth; ...
+```
+
+**Why it matters.** The journal is the right host for this data — F15's fix report gives the mechanical
+reason (DuckDB's lock makes a ledger-resident budget unshareable by the two processes that must share
+it, which B3 shows is true) — so I am not asking for it to move. Two smaller consequences are real:
+one exhausted source wrote **145 lines** in a minute of retries with no pruning and no rotation (reads
+only look at the last 20 000 lines, so the file grows while the view stays bounded), and the budget is
+invisible to the only tool the plan calls the source of truth: `agentoquant ledger query` cannot see
+it, so a reviewer asking "what did this cycle spend" has to know about a second file.
+
+**Spec line.** `plan.md:70` — "the ledger as the single source of truth". Also the recorded decision
+that quota spending is metered and reported.
+
+**Suggested fix.** Two changes, both small: name the journal's location in the ledger's own report/CLI
+(it is already in `ingest`'s report note — add it to `ledger query`'s output or a `quotas` named query)
+and add a refusal-throttle so a persistently exhausted source writes one refusal line per window rather
+than one per attempt.
+
 ---
