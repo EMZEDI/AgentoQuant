@@ -11,11 +11,11 @@ where something could not be verified it says so instead of guessing.
 | 1 | Package skeleton, seven config files, enums, config loader, CLI (11 commands) and an MCP server exposing the same leaves | `uv lock --check` clean (138 packages); 41 tests; `agentoquant ingest` exit 3 with no traceback; MCP over stdio exposes 12 tools |
 | 2 | Fourteen-stage decision ledger in DuckDB, named queries, cost meter | 14 tables; `ledger query --query cycles` returns 4 cycles with 14/12/13/14 stages; field-name drift against addendum §4–6: 0 |
 | 3 | Quota manager, cache, seven connectors, hourly snapshot orchestrator | Live snapshot across every source; four positional-argument wiring bugs found and fixed with a regression test that drives the real registry |
-| 4 | Early-signal listeners (Bybit, OKX, Kraken, GitHub releases, Google News RSS, Telegram previews, on-chain webhooks) and a runner | Live 90 s run: 892 events, 0 failures, 0 restarts, every record carrying a `source_class` |
-| 5 | Deterministic Risk Gate (22 rules), kill switch, funding floor | 18/18 acceptance checks against a real ledger; 133 adversarial tests, one case per rule |
+| 4 | Early-signal listeners (Bybit, OKX, Kraken, GitHub releases, Google News RSS, Telegram previews, on-chain webhooks) and a runner | Live 90 s run: 892 events, 0 failures, 0 restarts, every record carrying a `source_class`; per-module suites now total 178 tests, and each of the three acceptance criteria is verified **by mutation** — revert the behaviour, watch the test fail |
+| 5 | Deterministic Risk Gate (23 rules), kill switch, funding floor | 18/18 acceptance checks against a real ledger; 27 adversarial tests, one case per rule |
 | 6 | Paper harness, freqtrade dry-run bridge, order manager for the twelve-action vocabulary, signal store, Telegram notifier, scheduler, systemd units | 24 consecutive cycles, 0 failures, three real dry-run trades each tagged with its cycle id |
 
-Gate on `main`: **197 tests pass, 1 skipped (opt-in live cost check), ruff clean.**
+Gate on `main`: **376 tests pass, 1 skipped (opt-in live cost check), ruff clean.**
 
 ## The loop is running unattended
 
@@ -23,6 +23,17 @@ Gate on `main`: **197 tests pass, 1 skipped (opt-in live cost check), ruff clean
 - `agentoquant-freqtrade.service` runs the dry-run venue the loop hands decisions to. Without it the
   loop still records cycles but submits nothing, so a soak would prove nothing about execution.
 - Both installed and enabled; first timer tick 06:00 UTC.
+- **The soak was silently meaningless for its first nine cycles, and that is now fixed.** The timer
+  runs a fresh process every hour (`paper --hours 1`), and the placeholder's pattern step was a
+  per-invocation counter starting at zero, so every tick picked the first pattern entry: all nine
+  recorded cycles were `enter_laddered`, and a three-day run would have exercised one of twelve
+  vocabulary actions while looking perfectly healthy. The step is now anchored to the hour it
+  belongs to, so consecutive ticks advance. `tests/test_paper_sequence.py` covers it, including a
+  test that drives the real loop twice an hour apart. The soak re-accumulates from 2026-09-19 ~13:30.
+- **Notifications are off for the soak** (`AGENTOQUANT_TELEGRAM=0` in the unit). The placeholder card
+  says the same thing every hour, and a card per tick trains the reader to ignore the veto gate
+  before it matters. The notifier is exercised on demand, and the real veto window arrives with the
+  cascade in Phase 2 (Task 21).
 
 Firing the timer's own unit (`systemctl --user start agentoquant-hourly.service`) proved the
 unattended path end to end: exit 0, cycle `2026-09-19T05Z-0001`, action `enter_laddered`, verdict
@@ -51,7 +62,7 @@ a real artifact, and the stop ratchets as the position grows.
    three ladder slices and opened a position. An unfilled status on a filled order corrupts any cost
    or hit-rate accounting built on it, so this is a correctness bug, not a completeness gap.
 
-## Two real bugs, found only by running it against a live venue
+## Three real bugs, found only by running it against a live venue
 
 1. **Position adjustment was off.** The config never set `position_adjustment_enable`, so freqtrade
    reported `Position adjustment: Off` and never called `adjust_trade_position`. Laddered entries,
@@ -69,7 +80,7 @@ Both are fixed and covered by regression assertions in the follow-up execution t
 |---|---|
 | Only `enter_laddered` produced an order in a 24-cycle burst; `trim`, `add`, `exit`, `take_profit_ladder` reported `orders=0` with open positions present | Five of twelve vocabulary paths are unproven in dry-run. A follow-up agent is finding the root cause |
 | The one execution ledger row has `fill_price=None`, `fee_paid=None`, `status=unfilled_timeout` | Fills and fees are never written back, so the ledger cannot yet price realized cost per trade |
-| Dry-run fees come from ccxt (0.26%) rather than the account's live tier (0.40% maker / 0.80% taker) | Dry-run P&L is optimistic against the real fee schedule the plan insists on |
+| ~~Dry-run fees come from ccxt (0.26%) rather than the account's live tier (0.40% maker / 0.80% taker)~~ **fixed** | The venue now charges the real tier: `"fee": 0.004` in the config, and `assert_dry_run_config` fails closed if a dry-run config omits the fee or sets one below the current tier's maker rate. Verified live — the newest trade carries `fee_open = 0.004` where the older ones carried ccxt's `0.0026`. Stop exits are taker at 0.80% and the override is a single rate, so stop-outs are still simulated at the maker rate |
 | A partial exit was refused: `exit amount is now 0.0 due to exchange limits` at a ~$34 stake | The execution layer must pre-check the exchange minimum and treat it as a shrink/reject |
 | `kraken_listings` blog RSS returns HTTP 403 from this box (Cloudflare) | Only the AssetPairs polling path works for Kraken listings |
 | The on-chain receiver refuses to start without a signing secret (fail closed, correct) and has never received a real webhook | Parsing and attribution are proven with a signed real-shaped payload; delivery needs a public ingress |
@@ -93,6 +104,33 @@ not a trigger.
 Mitigation, in `.hermes.md` and `scripts/at_restore.py` (`mark` / `unmark`, exact inverses, round
 trip verified lossless): write `AT_MARK_` where a decorator's at-sign belongs, convert on disk
 before running pytest, and **commit after every file write**.
+
+## Adversary findings and ownership
+
+`docs/reviews/phase0_adversary.md` (merged) lists 18 reproduced findings. Every one now has an owner.
+The areas are deliberately disjoint: two agents in one file is how a merge conflict turns into lost
+work.
+
+| Finding | Sev | Owner |
+|---|---|---|
+| F13 kill switch unwired, `/flat` closes nothing | **blocker** | execution agent |
+| F1 execution rows report fills as `unfilled_timeout` | high | execution agent |
+| F4 `exit` and `cancel_order` throw `TypeError` at the venue | high | execution agent |
+| F5 plan price levels never reach hook paths; `take_profit_ladder` unreachable | high | execution agent |
+| F10 approved size is not the placed size | medium | execution agent |
+| F7 a severity-5 objection is approved | high | risk-gate agent |
+| F8 the gate is a pass-through for seven actions | medium | risk-gate agent |
+| F11 nothing detects stale data | medium | risk-gate agent |
+| F12 dead config keys; rule count 22 vs 23 | low | risk-gate agent |
+| F14 early signals bypass the quota manager | medium | quota agent |
+| F15 quota accounting is per process | medium | quota agent |
+| F3 the `outcome` stage has no writer | high | outcomes agent |
+| F2 two `risk_gate_verdict` rows per cycle | high | outcomes agent |
+| F9 the Ontario net-buy cap can never bind | high | outcomes agent (depends on F1) |
+| F16 tests that cannot fail | medium | **parity tautology fixed**; the ledger completeness test still needs F3 to land first |
+| F17 MCP name spelling; two stale numbers | low | **fixed** — the underscore mapping is now asserted as a stated deviation, and the two stale counts (22 rules, 133 tests) were corrected to 23 and 27 |
+| F18 the fee floor is the maker rate, so stops are simulated 0.4% cheap | medium | phase agent (documented, not fixed) |
+| F6 the soak evidence was nine identical cycles | medium | **fixed** (rotation, `tests/test_paper_sequence.py`) |
 
 ## Next
 
