@@ -14,6 +14,11 @@ Behaviour, in the order the task's hard requirements state it:
   its reason and backoff, which is the "restarts logged" evidence.
 * A heartbeat line every ``--status-every`` seconds carries each listener's counters, so a week of
   uptime is one file to read rather than a claim.
+* Every listener that fetches spends from one persisted
+  :class:`~agentoquant.data.quota_manager.QuotaManager` budget -- the same journal file the hourly
+  ingest process spends from -- so the seven early-signal sources are inside the ceilings
+  ``config/sources.yaml`` declares for them, and a source over budget is skipped with a recorded
+  reason instead of being fetched anyway.
 * SIGINT/SIGTERM stop it cleanly.
 
 The ``replay`` subcommand is the honest version of "replay of three past listing days": it takes
@@ -46,6 +51,7 @@ from agentoquant.data.early_signals import (
     as_utc,
     utcnow,
 )
+from agentoquant.data.quota_manager import QuotaManager
 from agentoquant.enums import SourceClass
 from agentoquant.ledger.store import LedgerStore
 
@@ -69,11 +75,16 @@ def build_listeners(
     only: Sequence[str] | None = None,
     interval_scale: float = 1.0,
     include_onchain: bool = True,
+    quota: QuotaManager | None = None,
 ) -> list[Any]:
     """Construct the default listener set, minus anything that cannot start.
 
     The on-chain receiver is skipped with a logged warning when no signing secret is configured: it
     refuses to run unauthenticated, and a missing secret must not stop the other five listeners.
+
+    Every listener that fetches is handed the same :class:`QuotaManager`, so the seven sources of the
+    early-signal layer spend from the same persisted budget as the hourly ingest rather than from a
+    per-listener interval guess (the F14 defect). :func:`quota_audit` is the check for that.
     """
     from agentoquant.data.early_signals.bybit_listings import BybitListingsListener
     from agentoquant.data.early_signals.github_releases import GithubReleasesListener
@@ -82,13 +93,26 @@ def build_listeners(
     from agentoquant.data.early_signals.okx_listings import OkxListingsListener
     from agentoquant.data.early_signals.telegram_previews import TelegramPreviewsListener
 
+    quota = quota if quota is not None else QuotaManager()
     factories: list[Callable[[], Any]] = [
-        lambda: BybitListingsListener(writer, log=log, interval_seconds=20.0 * interval_scale),
-        lambda: OkxListingsListener(writer, log=log, interval_seconds=30.0 * interval_scale),
-        lambda: KrakenListingsListener(writer, log=log, interval_seconds=20.0 * interval_scale),
-        lambda: GithubReleasesListener(writer, log=log, interval_seconds=600.0 * interval_scale),
-        lambda: GoogleNewsRssListener(writer, log=log, interval_seconds=300.0 * interval_scale),
-        lambda: TelegramPreviewsListener(writer, log=log, interval_seconds=60.0 * interval_scale),
+        lambda: BybitListingsListener(
+            writer, log=log, interval_seconds=20.0 * interval_scale, quota=quota
+        ),
+        lambda: OkxListingsListener(
+            writer, log=log, interval_seconds=30.0 * interval_scale, quota=quota
+        ),
+        lambda: KrakenListingsListener(
+            writer, log=log, interval_seconds=20.0 * interval_scale, quota=quota
+        ),
+        lambda: GithubReleasesListener(
+            writer, log=log, interval_seconds=600.0 * interval_scale, quota=quota
+        ),
+        lambda: GoogleNewsRssListener(
+            writer, log=log, interval_seconds=300.0 * interval_scale, quota=quota
+        ),
+        lambda: TelegramPreviewsListener(
+            writer, log=log, interval_seconds=60.0 * interval_scale, quota=quota
+        ),
     ]
     if include_onchain:
         factories.append(lambda: _build_onchain_receiver(writer, log))
@@ -103,6 +127,31 @@ def build_listeners(
             continue
         listeners.append(listener)
     return listeners
+
+
+def quota_audit(listeners: Sequence[Any]) -> list[str]:
+    """Name every fetcher that would make a request outside the shared quota manager.
+
+    Empty is the only acceptable answer for a listener that fetches: a fetcher with no manager (or no
+    ``sources.yaml`` name) spends a budget nobody counts, which is exactly what F14 found. The
+    push-only on-chain receiver owns no fetcher and is skipped.
+    """
+    unbudgeted: list[str] = []
+    for listener in listeners:
+        fetchers = listener.fetchers() if hasattr(listener, "fetchers") else []
+        for fetcher in fetchers:
+            if fetcher.quota is None or not fetcher.source:
+                unbudgeted.append(f"{listener.name}:{fetcher.base_url or 'fetcher'}")
+    return unbudgeted
+
+
+def quota_sources(listeners: Sequence[Any]) -> list[str]:
+    """The ``sources.yaml`` names the listener set spends from, sorted and deduplicated."""
+    sources: set[str] = set()
+    for listener in listeners:
+        fetchers = listener.fetchers() if hasattr(listener, "fetchers") else []
+        sources.update(fetcher.source for fetcher in fetchers if fetcher.source)
+    return sorted(sources)
 
 
 def _build_onchain_receiver(writer: SignalWriter, log: JsonlLog | None) -> Any:
@@ -145,6 +194,7 @@ class Runner:
         max_restart_backoff_seconds: float = MAX_RESTART_BACKOFF_SECONDS,
         clock: Callable[[], datetime] = utcnow,
         sleep: Callable[[float], None] = time.sleep,
+        quota: QuotaManager | None = None,
     ) -> None:
         self.listeners = list(listeners)
         self.log = log
@@ -152,6 +202,9 @@ class Runner:
         self.max_restart_backoff_seconds = max_restart_backoff_seconds
         self._clock = clock
         self._sleep = sleep
+        #: The shared budget the listeners spend from; reported in every heartbeat so a refusal is
+        #: visible in this process's own log, not only in the journal.
+        self.quota = quota
         self._stop = threading.Event()
         self._threads: dict[str, threading.Thread] = {}
         self.started_at: datetime | None = None
@@ -255,6 +308,8 @@ class Runner:
             "restarts_total": sum(entry["restarts"] for entry in listeners.values()),
             "events_total": sum(entry["events"] for entry in listeners.values()),
             "failures_total": sum(entry["failures"] for entry in listeners.values()),
+            "quota_journal": str(self.quota.journal_path) if self.quota else None,
+            "quota_breaches": self.quota.breaches() if self.quota else {},
         }
 
     def close(self) -> None:
@@ -552,17 +607,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     writer = SignalWriter(store, log=log)
+    quota = QuotaManager()
     listeners = build_listeners(
         writer,
         log=log,
         only=args.only.split(",") if args.only else None,
         interval_scale=args.interval_scale,
         include_onchain=not args.no_onchain,
+        quota=quota,
     )
     if not listeners:
         print("no listeners could be started", flush=True)
         return 2
-    runner = Runner(listeners, log=log)
+    unbudgeted = quota_audit(listeners)
+    if unbudgeted:
+        LOGGER.error("listeners fetching outside the quota manager: %s", ", ".join(unbudgeted))
+    log.write(
+        "quota_wired",
+        journal=str(quota.journal_path),
+        sources=quota_sources(listeners),
+        unbudgeted=unbudgeted,
+    )
+    runner = Runner(listeners, log=log, quota=quota)
 
     def _handle_signal(signum: int, _frame: Any) -> None:
         LOGGER.warning("signal %s received, stopping", signum)
@@ -597,6 +663,8 @@ __all__ = [
     "load_fixtures",
     "main",
     "parse_replay_body",
+    "quota_audit",
+    "quota_sources",
     "replay_fixture",
     "run_replay",
 ]

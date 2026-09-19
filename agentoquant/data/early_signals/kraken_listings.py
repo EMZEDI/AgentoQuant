@@ -41,6 +41,7 @@ from agentoquant.data.early_signals import (
     single_ticker,
     utcnow,
 )
+from agentoquant.data.quota_manager import QuotaManager
 from agentoquant.enums import SourceClass
 
 BASE_URL = "https://api.kraken.com"
@@ -51,6 +52,12 @@ RSS_PATH = "/feed/"
 #: Quotas from config/sources.yaml.
 ASSETPAIRS_CALLS_PER_MINUTE = 15
 RSS_CALLS_PER_MINUTE = 2
+
+#: The ``config/sources.yaml`` keys this listener's two fetches are charged to (the shared budget).
+#: AssetPairs is a Kraken public REST call, so it spends from the same ``kraken_rest`` ceiling the
+#: hourly ingest does; the blog feed is its own source.
+SOURCE = "kraken_rest"
+RSS_SOURCE = "kraken_listings_rss"
 
 #: Default AssetPairs poll interval: inside the plan's 10 to 30 second window.
 DEFAULT_ASSETPAIRS_INTERVAL_SECONDS = 20.0
@@ -234,6 +241,7 @@ class KrakenListingsListener(Listener):
         rss_interval_seconds: float = DEFAULT_RSS_INTERVAL_SECONDS,
         pairs_fetcher: HttpFetcher | None = None,
         rss_fetcher: HttpFetcher | None = None,
+        quota: QuotaManager | None = None,
         interval_seconds: float | None = None,
         log: JsonlLog | None = None,
         **kwargs: Any,
@@ -246,11 +254,15 @@ class KrakenListingsListener(Listener):
             base_url=BASE_URL,
             rate_limiter=RateLimiter(60.0 / ASSETPAIRS_CALLS_PER_MINUTE),
             max_retries=3,
+            quota=quota,
+            source=SOURCE,
         )
         self.rss_fetcher = rss_fetcher or HttpFetcher(
             base_url=RSS_BASE_URL,
             rate_limiter=RateLimiter(60.0 / RSS_CALLS_PER_MINUTE),
             max_retries=3,
+            quota=quota,
+            source=RSS_SOURCE,
         )
         self._known_pairs: set[str] | None = None
         self._last_rss_poll: float | None = None
@@ -348,6 +360,8 @@ __all__ = [
     "LISTING_TITLE_MARKERS",
     "RSS_CALLS_PER_MINUTE",
     "RSS_PATH",
+    "RSS_SOURCE",
+    "SOURCE",
     "KrakenListingsListener",
     "KrakenPairsState",
     "is_listing_item",

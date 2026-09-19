@@ -33,6 +33,7 @@ from agentoquant.data.early_signals import (
     single_ticker,
     utcnow,
 )
+from agentoquant.data.quota_manager import QuotaManager
 from agentoquant.enums import SourceClass
 
 BASE_URL = "https://www.okx.com"
@@ -46,6 +47,9 @@ ANNOUNCEMENT_TYPES: dict[str, str] = {
 
 #: Quota from config/sources.yaml: 10 calls/minute. One pass costs one call per announcement type.
 CALLS_PER_MINUTE = 10
+
+#: The ``config/sources.yaml`` key every call from this listener is charged to (the shared budget).
+SOURCE = "okx_announcements"
 
 
 def _ms_string_to_datetime(value: Any) -> datetime | None:
@@ -121,6 +125,7 @@ class OkxListingsListener(Listener):
         limit: int = 20,
         announcement_types: dict[str, str] | None = None,
         fetcher: HttpFetcher | None = None,
+        quota: QuotaManager | None = None,
         interval_seconds: float | None = None,
         log: JsonlLog | None = None,
         **kwargs: Any,
@@ -132,6 +137,8 @@ class OkxListingsListener(Listener):
             base_url=BASE_URL,
             rate_limiter=RateLimiter(60.0 / CALLS_PER_MINUTE),
             max_retries=3,
+            quota=quota,
+            source=SOURCE,
         )
 
     def poll(self) -> list[SignalEvent]:
@@ -161,6 +168,7 @@ __all__ = [
     "ANNOUNCEMENT_TYPES",
     "BASE_URL",
     "CALLS_PER_MINUTE",
+    "SOURCE",
     "OkxListingsListener",
     "parse_okx_announcements",
 ]
