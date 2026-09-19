@@ -34,6 +34,7 @@ from agentoquant.data.early_signals import (
     single_ticker,
     utcnow,
 )
+from agentoquant.data.quota_manager import QuotaManager
 from agentoquant.enums import SourceClass
 
 BASE_URL = "https://api.bybit.com"
@@ -47,6 +48,9 @@ WATCHED_TYPE_KEYS: tuple[str, ...] = LISTING_TYPE_KEYS + DELISTING_TYPE_KEYS
 
 #: Quota from config/sources.yaml: 10 calls/minute.
 CALLS_PER_MINUTE = 10
+
+#: The ``config/sources.yaml`` key every call from this listener is charged to (the shared budget).
+SOURCE = "bybit_announcements"
 
 
 def _ms_to_datetime(value: Any) -> datetime | None:
@@ -125,6 +129,7 @@ class BybitListingsListener(Listener):
         locale: str = "en-US",
         limit: int = 20,
         fetcher: HttpFetcher | None = None,
+        quota: QuotaManager | None = None,
         interval_seconds: float | None = None,
         log: JsonlLog | None = None,
         **kwargs: Any,
@@ -136,6 +141,8 @@ class BybitListingsListener(Listener):
             base_url=BASE_URL,
             rate_limiter=RateLimiter(60.0 / CALLS_PER_MINUTE),
             max_retries=3,
+            quota=quota,
+            source=SOURCE,
         )
 
     def poll(self) -> list[SignalEvent]:
@@ -161,6 +168,7 @@ __all__ = [
     "CALLS_PER_MINUTE",
     "DELISTING_TYPE_KEYS",
     "LISTING_TYPE_KEYS",
+    "SOURCE",
     "WATCHED_TYPE_KEYS",
     "BybitListingsListener",
     "parse_bybit_announcements",

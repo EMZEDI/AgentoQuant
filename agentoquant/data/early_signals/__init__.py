@@ -48,6 +48,7 @@ from typing import Any, ClassVar
 
 import httpx
 
+from agentoquant.data.quota_manager import QuotaExceeded, QuotaManager
 from agentoquant.enums import Harness, ModelFamily, SourceClass, Stage
 from agentoquant.ledger.schema import EarlySignalPayload
 from agentoquant.ledger.store import LedgerStore
@@ -186,21 +187,36 @@ class SignalEvent:
 
 
 # ----------------------------------------------------------------------------------------------
-# HTTP: rate limiting and backoff, httpx only (no shared quota manager: Task 3 owns that, Task 6 wires)
+# HTTP: quota, rate limiting and backoff, httpx only
 # ----------------------------------------------------------------------------------------------
+#: The repo-wide quota manager owns the budget for every source that makes a request, including these
+#: seven (``config/sources.yaml``). Each listener passes its ``sources.yaml`` name to its
+#: :class:`HttpFetcher`, and every attempt is reserved with :meth:`QuotaManager.acquire` **before** the
+#: request leaves the process: a source over its declared ceiling is skipped with a recorded reason
+#: rather than being counted after the fact. The local :class:`RateLimiter` stays as a spacing guard,
+#: but it is no longer the only thing standing between a listener and a quota breach.
 
 
 class FetchError(RuntimeError):
     """A source could not be fetched after the configured retries. Never fatal to a listener."""
 
 
+class FetchQuotaExceeded(FetchError):
+    """The shared quota manager refused the call before any request was sent.
+
+    A :class:`FetchError` subclass on purpose: every listener already treats a ``FetchError`` as
+    "this source is unavailable this pass" (skip it, log why, try again later), which is exactly the
+    graceful-degradation behaviour a quota refusal needs.
+    """
+
+
 class RateLimiter:
     """Minimum interval between calls, shared by a listener's threads.
 
-    Deliberately tiny and local: Task 3 owns the repo-wide quota manager and Task 6 wires these
-    listeners into it. Until then each listener enforces its own source's ceiling from
-    ``config/sources.yaml`` (Bybit/OKX 10 calls/min, Kraken listings RSS 2 calls/min, GitHub 30 calls/h,
-    Google News and Telegram 6 calls/min).
+    A spacing guard, not a budget: the repo-wide :class:`~agentoquant.data.quota_manager.QuotaManager`
+    owns the declared ceilings (rolling per minute/hour/day), and each listener routes its fetches
+    through it with the source name from ``config/sources.yaml``. This limiter keeps two threads of one
+    listener from firing at the same instant, which the rolling-window manager does not express.
     """
 
     def __init__(
@@ -229,10 +245,17 @@ class RateLimiter:
 
 @dataclass
 class HttpFetcher:
-    """A small httpx wrapper: rate limited, retried with exponential backoff, redirects followed.
+    """A small httpx wrapper: quota-reserved, rate limited, retried with backoff, redirects followed.
 
     ``client`` may be injected (``httpx.Client(transport=httpx.MockTransport(...))`` in tests) so the
     default suite never touches the network.
+
+    ``quota`` and ``source`` are what make a listener report to the repo-wide budget: when both are
+    set, every attempt calls :meth:`QuotaManager.acquire` for ``source`` (the ``config/sources.yaml``
+    key) before the request is sent, and a call that would breach the ceiling raises
+    :class:`FetchQuotaExceeded` without touching the socket. Leaving ``quota`` unset keeps the fetcher
+    usable standalone (tests, one-off scripts) with only the local limiter -- but the runner always
+    wires it, so no production listener path is unbudgeted.
     """
 
     base_url: str = ""
@@ -244,6 +267,9 @@ class HttpFetcher:
     rate_limiter: RateLimiter | None = None
     client: httpx.Client | None = None
     sleep: Callable[[float], None] = time.sleep
+    #: The repo-wide budget this fetcher reports to, and the ``sources.yaml`` name it spends from.
+    quota: QuotaManager | None = None
+    source: str = ""
     #: Status codes worth retrying. 429 and 5xx are transient; 4xx otherwise is a permanent answer.
     retry_statuses: frozenset[int] = frozenset({408, 425, 429, 500, 502, 503, 504})
 
@@ -268,6 +294,22 @@ class HttpFetcher:
         raw = self.backoff_seconds * (2 ** max(0, attempt - 1))
         return min(raw, self.max_backoff_seconds) * (1.0 + random.random() * 0.1)
 
+    def reserve(self, method: str, url: str) -> None:
+        """Reserve one call with the shared quota manager, or raise :class:`FetchQuotaExceeded`.
+
+        Called before every attempt, so a retry spends a second unit of the budget -- which is correct,
+        because a retry is a second request. The refusal happens before the socket, and the manager
+        journals the reason, so the skip is auditable in either process.
+        """
+        if self.quota is None or not self.source:
+            return
+        try:
+            self.quota.acquire(self.source, detail=f"{method} {url}")
+        except QuotaExceeded as exc:
+            raise FetchQuotaExceeded(
+                f"{self.source}: quota refused before the request: {exc}"
+            ) from exc
+
     def request(
         self,
         method: str,
@@ -277,12 +319,13 @@ class HttpFetcher:
         json_body: Any = None,
         headers: dict[str, str] | None = None,
     ) -> httpx.Response:
-        """One rate-limited request, retried on transport errors and transient statuses."""
+        """One quota-reserved, rate-limited request, retried on transport errors and transient statuses."""
         url = path_or_url if path_or_url.startswith(("http://", "https://")) else (
             f"{self.base_url.rstrip('/')}/{path_or_url.lstrip('/')}"
         )
         last_error: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
+            self.reserve(method, url)
             if self.rate_limiter is not None:
                 self.rate_limiter.acquire()
             try:
@@ -626,6 +669,14 @@ class Listener(ABC):
         self._clock = clock
         self.stats = ListenerStats()
 
+    def fetchers(self) -> list[HttpFetcher]:
+        """Every HTTP fetcher this listener owns.
+
+        The runner audits these to prove no listener fetches outside the shared quota manager; a
+        listener that builds a fetcher without ``quota``/``source`` would show up here as unbudgeted.
+        """
+        return [value for value in vars(self).values() if isinstance(value, HttpFetcher)]
+
     # -- to implement -------------------------------------------------------------------------
 
     @abstractmethod
@@ -723,6 +774,7 @@ __all__ = [
     "PRODUCER_ROLE_PREFIX",
     "USER_AGENT",
     "FetchError",
+    "FetchQuotaExceeded",
     "HttpFetcher",
     "JsonlLog",
     "Listener",
