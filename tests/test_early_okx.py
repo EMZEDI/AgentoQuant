@@ -32,8 +32,8 @@ from agentoquant.data.early_signals import (
     utcnow,
 )
 from agentoquant.data.early_signals.okx_listings import (
-    ANNOUNCEMENTS_PATH,
     ANNOUNCEMENT_TYPES,
+    ANNOUNCEMENTS_PATH,
     OkxListingsListener,
     parse_okx_announcements,
 )
@@ -88,8 +88,9 @@ def body(*details: dict[str, Any], code: str = "0", msg: str = "") -> dict[str, 
 
 
 def make_listener(writer: SignalWriter, fetcher: Any, **kwargs: Any) -> OkxListingsListener:
-    """An OKX listener wired to a canned fetcher, with a single announcement type by default."""
+    """An OKX listener wired to a canned fetcher, one announcement type, logging to the writer's log."""
     kwargs.setdefault("announcement_types", {"announcements-new-listings": "listing"})
+    kwargs.setdefault("log", writer.log)
     return OkxListingsListener(writer, fetcher=fetcher, **kwargs)
 
 
@@ -407,6 +408,7 @@ def test_run_polls_once_then_stops_inside_the_interval(tmp_path: Any, monkeypatc
     assert listener.stats.written == 1
     assert [record["event"] for record in log_events(writer.log)] == [
         "listener_start",
+        "signal",
         "poll_ok",
         "listener_stop",
     ]
