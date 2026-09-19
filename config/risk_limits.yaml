@@ -7,10 +7,16 @@
 version: 1
 
 positions:
+  # Read by the gate. min_concurrent is the number of positions the book is meant to spread across:
+  # one position may take at most its sleeve's cap divided by this, so raising it tightens the
+  # per-position cap and never loosens it. max_concurrent is the concurrency rule's limit.
   min_concurrent: 3
   max_concurrent: 5
   # Per-position cap as a percent of book value (plan: 15 percent).
   max_position_pct: 15
+  # Read by the gate as the sleeve's cap. The effective cap is the tighter of this and the sleeve's
+  # cap_pct in config/sleeves.yaml, so a value here can only tighten the limit. (sleeves.yaml's
+  # cap_pct is also the sleeve's target for the free-cash floor.)
   sleeve_caps_pct:
     A: 100
     B: 35
