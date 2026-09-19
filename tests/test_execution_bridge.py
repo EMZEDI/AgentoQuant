@@ -812,6 +812,42 @@ def test_a_disabled_notifier_sends_nothing() -> None:
     assert notifications_enabled({"AGENTOQUANT_TELEGRAM": "1"}) is True
 
 
+def test_notifications_are_opt_in_so_unset_means_silent() -> None:
+    """An unset switch must mean *off*, not on.
+
+    This is the regression test for a real incident: ``notifications_enabled`` used to return True
+    whenever ``AGENTOQUANT_TELEGRAM`` was unset. The loop tests run real cycles with ``notify=True``
+    and resolve the bot token from ``~/.hermes/.env``, so the suite posted 90 Decision Cards to a
+    real phone in half an hour - and a test that *deleted* the variable made it worse, because
+    deleting it was what enabled sending. Unset, blank and any unrecognised value are all off.
+    """
+    assert notifications_enabled({}) is False
+    assert notifications_enabled({"AGENTOQUANT_TELEGRAM": ""}) is False
+    assert notifications_enabled({"AGENTOQUANT_TELEGRAM": "   "}) is False
+    assert notifications_enabled({"AGENTOQUANT_TELEGRAM": "maybe"}) is False
+    assert notifications_enabled({"OTHER": "1"}) is False
+
+    for value in ("1", "true", "TRUE", " True ", "yes", "on"):
+        assert notifications_enabled({"AGENTOQUANT_TELEGRAM": value}) is True, value
+
+    for value in ("0", "false", "no", "off", "False"):
+        assert notifications_enabled({"AGENTOQUANT_TELEGRAM": value}) is False, value
+
+
+def test_the_test_suite_itself_cannot_reach_telegram() -> None:
+    """The autouse guard in ``conftest`` must hold even after a test monkeypatches the environment.
+
+    The opt-in default is the fix; this is the belt to its braces. If this test ever fails, a test
+    run is one ``notify=True`` away from messaging Shahrad again.
+    """
+    import os
+
+    assert notifications_enabled(dict(os.environ)) is False
+    assert os.environ.get("AGENTOQUANT_TELEGRAM") == "0"
+    assert os.environ.get("AGENTOQUANT_TELEGRAM_BOT_TOKEN") == ""
+    assert os.environ.get("AGENTOQUANT_TELEGRAM_CHAT_ID") == ""
+
+
 def test_an_unconfigured_notifier_never_raises(tmp_path: Path, monkeypatch) -> None:
     """With no credential reachable anywhere, a send is refused rather than attempted."""
     from agentoquant.execution import telegram_bot

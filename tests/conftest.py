@@ -15,6 +15,22 @@ import pytest
 from agentoquant import config_loader
 
 
+@pytest.fixture(autouse=True)
+def _never_notify(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force outbound notifications off for every test, whatever the test does.
+
+    This exists because of a real incident: ``notifications_enabled`` used to treat an *unset*
+    ``AGENTOQUANT_TELEGRAM`` as enabled, and the loop tests run real cycles with ``notify=True`` while
+    resolving the bot token from ``~/.hermes/.env``. So the suite posted Decision Cards to Shahrad's
+    phone - 90 of them in half an hour - and a test that *deleted* the variable made it worse. The
+    default is now opt-in, and this autouse fixture is the belt to that braces: no test can reach
+    Telegram even if a test monkeypatches the environment itself.
+    """
+    monkeypatch.setenv("AGENTOQUANT_TELEGRAM", "0")
+    monkeypatch.setenv("AGENTOQUANT_TELEGRAM_BOT_TOKEN", "")
+    monkeypatch.setenv("AGENTOQUANT_TELEGRAM_CHAT_ID", "")
+
+
 @pytest.fixture
 def repo_root() -> Path:
     return config_loader.repo_root()

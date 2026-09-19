@@ -35,8 +35,11 @@ API_ROOT = "https://api.telegram.org"
 TOKEN_VARS: tuple[str, ...] = ("TELEGRAM_BOT_TOKEN", "AGENTOQUANT_TELEGRAM_BOT_TOKEN")
 CHAT_VARS: tuple[str, ...] = ("TELEGRAM_HOME_CHANNEL", "AGENTOQUANT_TELEGRAM_CHAT_ID")
 
-#: Set to 0/false to disable notifications without touching credentials.
+#: The switch. Notifications are OFF unless this is set to one of ENABLE_VALUES.
 ENABLE_ENV = "AGENTOQUANT_TELEGRAM"
+
+#: The only values that turn notifications ON. Anything else, including an unset variable, is off.
+ENABLE_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 
 #: The Hermes environment file that already holds the bot token.
 HERMES_ENV_PATH = Path.home() / ".hermes" / ".env"
@@ -118,10 +121,17 @@ def resolve_telegram_credentials(
 
 
 def notifications_enabled(environ: dict[str, str] | None = None) -> bool:
-    """Whether outbound notifications are switched on (``AGENTOQUANT_TELEGRAM=0`` turns them off)."""
+    """Whether outbound notifications are switched on. **Opt-in, and unset means silent.**
+
+    This used to be enabled whenever ``AGENTOQUANT_TELEGRAM`` was unset, which meant any process on
+    the box that could reach the bot token posted to Shahrad's phone - including the test suite,
+    which runs real cycles: deleting the variable in a test *enabled* sending, and 90 Decision Cards
+    arrived in half an hour. A notification path that fires when nobody asked is worse than one that
+    stays quiet, so the two places that want it turn it on explicitly: the soak's systemd unit, and
+    Task 21's veto gate.
+    """
     env = environ if environ is not None else dict(os.environ)
-    value = str(env.get(ENABLE_ENV, "")).strip().lower()
-    return value not in {"0", "false", "no", "off"}
+    return str(env.get(ENABLE_ENV, "")).strip().lower() in ENABLE_VALUES
 
 
 class SendTransport(Protocol):
